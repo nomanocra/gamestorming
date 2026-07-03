@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Horde Survivor — Prototype 3D</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a12;
+    position: fixed; inset: 0; touch-action: none; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  body { font-family: -apple-system, "Segoe UI", system-ui, sans-serif; color: #e8e8f0; }
+  #app { position: absolute; inset: 0; touch-action: none; }
+  canvas { display: block; touch-action: none; }
+
+  /* HUD */
+  #hud { position: absolute; inset: 0; pointer-events: none; z-index: 5; }
+  #score { position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    font-size: 34px; font-weight: 800; color: #b9ff9a; text-shadow: 0 2px 8px rgba(0,0,0,.6); }
+  #hpwrap { position: absolute; top: 16px; left: 16px; width: 240px; }
+  #hpbg { background: rgba(0,0,0,.45); border-radius: 6px; height: 22px; overflow: hidden; }
+  #hp { height: 100%; width: 100%; background: linear-gradient(90deg,#e0464a,#ff6a6e); transition: width .1s; }
+  #hptxt { position: absolute; top: 3px; left: 10px; font-size: 12px; font-weight: 700; }
+  #weap { margin-top: 6px; font-size: 13px; font-weight: 700; opacity: .9; text-shadow: 0 1px 3px #000; }
+  #kills { position: absolute; top: 18px; right: 16px; font-size: 16px; font-weight: 700; text-shadow: 0 1px 3px #000; }
+  #bosstimer { position: absolute; top: 52px; left: 50%; transform: translateX(-50%); font-size: 14px; font-weight: 700; opacity: .8; text-shadow: 0 1px 3px #000; }
+  #bossbar { position: absolute; top: 54px; left: 50%; transform: translateX(-50%); width: min(560px, 80vw); height: 24px; background: rgba(0,0,0,.5); border: 1px solid #a33; border-radius: 6px; overflow: hidden; }
+  #bossfill { height: 100%; width: 100%; background: linear-gradient(90deg,#c0202a,#ff6a4a); transition: width .1s; }
+  #bossbar span { position: absolute; left: 0; right: 0; top: 3px; text-align: center; font-size: 13px; font-weight: 800; letter-spacing: 1px; text-shadow: 0 1px 2px #000; }
+  #buffs { position: absolute; top: 44px; right: 16px; font-size: 16px; text-align: right; line-height: 1.5; text-shadow: 0 1px 3px #000; }
+  #slots { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); display: flex; gap: 12px; }
+  .slot { width: 58px; height: 58px; background: rgba(0,0,0,.5); border: 1.5px solid rgba(255,255,255,.25);
+    border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 30px; position: relative;
+    pointer-events: auto; cursor: pointer; }
+  .slot.armed { border-color: #fff; border-width: 3px; box-shadow: 0 0 16px rgba(255,255,255,.4); }
+  .slot .n { position: absolute; top: 2px; left: 5px; font-size: 11px; opacity: .5; }
+  #toast { position: absolute; top: 64px; left: 50%; transform: translateX(-50%); font-size: 18px; font-weight: 800; color: #ffe98a; text-shadow: 0 2px 6px #000; opacity: 0; transition: opacity .2s; }
+
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 18px; background: rgba(6,6,14,.86); backdrop-filter: blur(3px);
+    z-index: 10; text-align: center; padding: 24px; }
+  .hidden { display: none !important; }
+  h1 { font-size: clamp(28px,6vw,56px); letter-spacing: 1px; font-weight: 800;
+    background: linear-gradient(90deg,#7cf,#9f8,#fc6); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .sub { opacity: .72; max-width: 540px; line-height: 1.5; font-size: 15px; }
+  .keys { opacity: .55; font-size: 13px; line-height: 1.7; }
+  .btn { background: linear-gradient(180deg,#3a3a5a,#26263e); border: 1px solid #55557a; color: #fff;
+    padding: 13px 28px; font-size: 17px; font-weight: 700; border-radius: 12px; cursor: pointer;
+    box-shadow: 0 4px 0 #14141f, 0 8px 24px rgba(0,0,0,.4); pointer-events: auto; }
+  .btn:active { transform: translateY(2px); }
+  .tag { font-size: 12px; letter-spacing: 2px; opacity: .5; text-transform: uppercase; }
+  .setting { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+  .setting label { font-size: 14px; opacity: .85; }
+  .setting b { color: #9f8; }
+  .setting input[type=range] { width: 260px; accent-color: #8af; cursor: pointer; }
+  input { background: #14141f; border: 1px solid #45456a; border-radius: 10px; color: #fff;
+    padding: 12px 16px; font-size: 16px; text-align: center; width: 220px; outline: none; pointer-events: auto; }
+  input:focus { border-color: #8af; }
+  .board { list-style: none; width: 300px; max-width: 88vw; }
+  .board li { display: flex; justify-content: space-between; padding: 7px 12px; border-radius: 8px; font-size: 15px; }
+  .board li:nth-child(odd) { background: rgba(255,255,255,.04); }
+  .board .me { background: rgba(120,160,255,.18); }
+  .board .rk { opacity: .5; width: 28px; text-align: left; }
+  .board .nm { flex: 1; text-align: left; padding-left: 8px; }
+  .board .sc { color: #9f8; font-weight: 700; }
+  .row { display: flex; gap: 10px; }
+  .stats { display: flex; gap: 26px; flex-wrap: wrap; justify-content: center; opacity: .85; }
+  .stats b { color: #9f8; font-size: 22px; display: block; }
+  .lbstatus { font-size: 12px; opacity: .5; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="hud" class="hidden">
+  <div id="score">0</div>
+  <div id="bosstimer"></div>
+  <div id="bossbar" class="hidden"><div id="bossfill"></div><span>👹 BOSS</span></div>
+  <div id="hpwrap"><div id="hpbg"><div id="hp"></div></div><div id="hptxt"></div><div id="weap"></div></div>
+  <div id="kills">☠ 0</div>
+  <div id="buffs"></div>
+  <div id="toast"></div>
+  <div id="slots">
+    <div class="slot" data-i="0"><span class="n">1</span></div>
+    <div class="slot" data-i="1"><span class="n">2</span></div>
+    <div class="slot" data-i="2"><span class="n">3</span></div>
+  </div>
+</div>
+
+<div id="startScreen" class="overlay">
+  <div class="tag">Prototype 3D · low-poly</div>
+  <h1>HORDE SURVIVOR</h1>
+  <div class="sub">Survis dans l'arène. Tir automatique. Ramasse les objets qui apparaissent : armes, buffs, et objets spéciaux (bombe, laser, ricochet) à lancer à la souris. À la mort, ton score part au classement.</div>
+  <div class="setting">
+    <label>⏱️ Boss après <b id="bossVal">5:00</b></label>
+    <input id="bossSlider" type="range" min="0" max="300" step="30" value="300" />
+  </div>
+  <button class="btn" id="startBtn">▶ Jouer</button>
+  <div class="keys">Déplacement : WASD / flèches (ZQSD sur AZERTY)<br>Objets : 1 2 3 ou clic sur le slot, puis clic au sol pour viser<br>M : son · P : pause · B : boss immédiat</div>
+</div>
+
+<div id="deathScreen" class="overlay hidden">
+  <h1 style="background:linear-gradient(90deg,#f66,#f96);-webkit-background-clip:text;background-clip:text;color:transparent;">GAME OVER</h1>
+  <div class="stats" id="deathStats"></div>
+  <div class="row" id="nameRow"><input id="nameInput" maxlength="12" placeholder="Ton pseudo" /><button class="btn" id="saveBtn">Envoyer</button></div>
+  <div class="lbstatus" id="lbStatus"></div>
+  <ol class="board" id="board"></ol>
+  <button class="btn" id="againBtn">↻ Rejouer</button>
+  <div class="keys">Entrée pour envoyer · R pour rejouer</div>
+</div>
+<script type="module" src="/src/game.js"></script>
+</body>
+</html>

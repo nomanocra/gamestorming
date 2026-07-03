@@ -1,0 +1,18 @@
+{
+  "name": "horde-survivor",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "npm-run-all -p dev:server dev:client",
+    "dev:client": "npm run dev -w client",
+    "dev:server": "npm run dev -w server",
+    "build": "npm run build -w client"
+  },
+  "devDependencies": {
+    "npm-run-all": "^4.1.5"
+  }
+}
