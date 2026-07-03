@@ -1,6 +1,6 @@
 # Gamestorming — Horde Survivor (prototype)
 
-Prototype d'un jeu de survie type *horde survivor* en **3D isométrique** (Three.js), inspiré du style TUNIC : low-poly, éclairage soigné, bloom néon.
+Prototype d'un jeu de survie type *horde survivor* en **3D isométrique** (Three.js) : low-poly, éclairage soigné, bloom néon.
 
 ## Concept
 
