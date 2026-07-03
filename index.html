@@ -437,7 +437,7 @@ function computeWeapon(key, lvl) {
     pierce: b.pierce + Math.floor((lvl - 1) / 4),        // +1 perçage tous les 4 niveaux
   };
 }
-const ITEMS = { bombe:{ name:"Bombe", ico:"💣", col:0xff7a4a }, laser:{ name:"Laser", ico:"🔺", col:0x6cf0ff }, grenade:{ name:"Ricochet", ico:"🪀", col:0xb98cff } };
+const ITEMS = { bombe:{ name:"Bombe", ico:"💣", col:0xff7a4a }, laser:{ name:"Laser", ico:"🔺", col:0x6cf0ff }, grenade:{ name:"Boomerang", ico:"🪃", col:0xb98cff } };
 const ITEM_KEYS = Object.keys(ITEMS);
 const BUFFS = {
   bouclier:{ ico:"🛡️", col:0x7cccff, apply:p => p.shield = Math.max(p.shield, 6) },
@@ -552,10 +552,11 @@ function useItem(slot, wx, wz) {
     beep(300, 0.5, "sawtooth", 0.05);
   } else if (key === "grenade") {
     const a = Math.atan2(wz - player.z, wx - player.x);
-    const m = new THREE.Mesh(GEO.orb, new THREE.MeshStandardMaterial({ color: 0xb98cff, emissive: 0xb98cff, emissiveIntensity: 1.5, flatShading: true }));
-    m.position.set(player.x, 1, player.z); scene.add(m);
-    effects.push({ type:"grenade", x:player.x, z:player.z, vx:Math.cos(a)*38, vz:Math.sin(a)*38, life:2.6, r:0.9, dmg:40, hit:new Set(), mesh:m });
-    beep(400, 0.08, "square", 0.04);
+    const m = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.25, 0.5),
+      new THREE.MeshStandardMaterial({ color: 0xb98cff, emissive: 0xb98cff, emissiveIntensity: 1.7, flatShading: true }));
+    m.position.set(player.x, BULLET_Y, player.z); scene.add(m);
+    effects.push({ type:"boomerang", x:player.x, z:player.z, vx:Math.cos(a)*42, vz:Math.sin(a)*42, speed:42, life:5, r:1.1, dmg:32, bounces:6, hit:new Set(), mesh:m });
+    beep(520, 0.1, "square", 0.04);
   }
   player.inv[slot] = null; armed = -1;
 }
@@ -761,10 +762,21 @@ function update(dt) {
   // effets
   for (let i = effects.length - 1; i >= 0; i--) {
     const f = effects[i];
-    if (f.type === "grenade") {
+    if (f.type === "boomerang") {
       f.x += f.vx * dt; f.z += f.vz * dt; f.life -= dt;
-      for (const e of enemies) if (!f.hit.has(e) && dist2(f.x, f.z, e.x, e.z) < (f.r + e.r) ** 2) { e.hp -= f.dmg; e.flash = 0.1; f.hit.add(e); }
-      if (f.life <= 0) { explode(f.x, f.z, 7, 60); scene.remove(f.mesh); effects.splice(i, 1); }
+      for (const e of enemies) {
+        if (f.hit.has(e)) continue;
+        if (dist2(f.x, f.z, e.x, e.z) < (f.r + e.r) ** 2) {
+          e.hp -= f.dmg; e.flash = 0.12; f.hit.add(e); f.bounces--;
+          spawnParticles(f.x, f.z, 0xb98cff, 6);
+          // ricochet : on repart vers l'ennemi le plus proche pas encore touché
+          let nx = null, nd = 30 * 30;
+          for (const o of enemies) { if (f.hit.has(o)) continue; const d = dist2(f.x, f.z, o.x, o.z); if (d < nd) { nd = d; nx = o; } }
+          if (nx) { const a = Math.atan2(nx.z - f.z, nx.x - f.x); f.vx = Math.cos(a) * f.speed; f.vz = Math.sin(a) * f.speed; }
+          break;
+        }
+      }
+      if (f.bounces <= 0 || f.life <= 0) { spawnParticles(f.x, f.z, 0xb98cff, 10); scene.remove(f.mesh); effects.splice(i, 1); }
     } else if (f.type === "laser") {
       f.life -= dt;
       laserDamage(player.x, player.z, player.x + Math.cos(f.ang) * 100, player.z + Math.sin(f.ang) * 100, f.dps * dt, 1.6);
@@ -888,7 +900,7 @@ function syncMeshes() {
   for (const p of pickups) { p.mesh.position.set(p.x, 1.2 + Math.sin(gameTime * 3 + p.bob) * 0.25, p.z); p.mesh.rotation.y += 0.03; }
   for (const p of particles) p.mesh.position.set(p.x, p.y, p.z);
   for (const f of effects) {
-    if (f.type === "grenade") f.mesh.position.set(f.x, 1, f.z);
+    if (f.type === "boomerang") { f.mesh.position.set(f.x, BULLET_Y, f.z); f.mesh.rotation.y += 0.7; }
     else if (f.type === "boom") { const k = 1 - f.life / f.max; f.mesh.scale.setScalar(0.5 + f.radius * k); f.mesh.material.opacity = f.life / f.max; f.mesh.material.transparent = true; }
     else if (f.type === "laser") {
       f.mesh.position.set(player.x + Math.cos(f.ang) * f.len / 2, 1.1, player.z + Math.sin(f.ang) * f.len / 2);
