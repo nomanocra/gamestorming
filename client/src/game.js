@@ -3,7 +3,7 @@ import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import { connectArena, sendPos, getRoom, getSessionId } from "./net/room";
+import { connectArena, sendPos, sendHit, sendDensity, getRoom, getSessionId } from "./net/room";
 
 // ============================================================
 //  CONFIG CLASSEMENT MONDIAL (Supabase). Vide = high-score LOCAL.
@@ -366,8 +366,13 @@ function startGame() {
   document.getElementById("deathScreen").classList.add("hidden");
   document.getElementById("hud").classList.remove("hidden");
   state = "play"; lastT = performance.now();
-  // --- multijoueur : rejoindre l'arène partagée (présence). Idempotent. ---
-  connectArena((localStorage.getItem("hs_name") || "Joueur").slice(0, 12));
+  // densité de horde voulue (curseur de test, local uniquement)
+  const ds = document.getElementById("densSlider");
+  wantDensity = (IS_LOCAL && ds) ? +ds.value : 1;
+  sentDensity = -1; // force le renvoi au serveur (utile si on est l'hôte)
+  // --- multijoueur : rejoindre l'arène partagée. Idempotent. ---
+  // density/bossDelay ne s'appliquent que si on est le 1er joueur (hôte) qui crée la room.
+  connectArena((localStorage.getItem("hs_name") || "Joueur").slice(0, 12), { density: wantDensity, bossDelay });
 }
 
 // ============================================================
@@ -460,7 +465,7 @@ function mkLaser(ang) {
   return { type:"laser", ang, life:0.9, max:0.9, dps:90, len, mesh };
 }
 function explode(x, z, radius, dmg) {
-  for (const e of enemies) if (dist2(x, z, e.x, e.z) < (radius + e.r) ** 2) { e.hp -= dmg; e.flash = 0.1; }
+  for (const e of enemies) if (dist2(x, z, e.x, e.z) < (radius + e.r) ** 2) { damageEnemy(e, dmg); e.flash = 0.1; }
   spawnParticles(x, z, 0xff9a4a, 22);
   const ring = new THREE.Mesh(new THREE.TorusGeometry(1, 0.4, 6, 24), new THREE.MeshBasicMaterial({ color: 0xff9a4a }));
   ring.rotation.x = -Math.PI / 2; ring.position.set(x, 0.5, z); scene.add(ring);
@@ -472,7 +477,7 @@ function laserDamage(x1, z1, x2, z2, dmg, w) {
     const dx = x2 - x1, dz = z2 - z1, L2 = dx*dx + dz*dz || 1;
     let t = ((e.x - x1) * dx + (e.z - z1) * dz) / L2; t = clamp(t, 0, 1);
     const px = x1 + t * dx, pz = z1 + t * dz;
-    if (dist2(e.x, e.z, px, pz) < (w + e.r) ** 2) { e.hp -= dmg; e.flash = 0.1; }
+    if (dist2(e.x, e.z, px, pz) < (w + e.r) ** 2) { damageEnemy(e, dmg); e.flash = 0.1; }
   }
 }
 
@@ -584,6 +589,7 @@ requestAnimationFrame(loop);
 const remoteAvatars = new Map();   // sessionId -> THREE.Group
 let netSendT = 0;
 const NET_HZ = 15;                  // fréquence d'envoi de la position
+let wantDensity = 1, sentDensity = -1;   // densité de horde voulue (outil de test)
 
 function makeRemoteAvatar(px, pz) {
   const g = new THREE.Group();
@@ -603,9 +609,103 @@ function makeRemoteAvatar(px, pz) {
   return g;
 }
 
+// --- co-op : horde autoritaire serveur reflétée dans le tableau `enemies` ---
+const inCoop = () => !!getRoom();
+const netEnemies = new Map();               // serverId -> ennemi miroir (aussi dans `enemies`)
+const ENEMY_DMG = { grunt: 9, runner: 6, brute: 24, boss: 45 };
+
+function buildNetEnemy(id, se) {
+  const isBoss = se.kind === "boss";
+  let mesh, mat;
+  if (isBoss) {
+    mat = new THREE.MeshStandardMaterial({ color: 0x3a0d10, emissive: 0xff2a2a, emissiveIntensity: 0.7, flatShading: true });
+    mesh = new THREE.Mesh(new THREE.DodecahedronGeometry(se.r, 0), mat);
+    toast("👹 LE BOSS ARRIVE !"); shake = 1.0; beep(70, 0.6, "sawtooth", 0.08);
+  } else {
+    const kind = se.kind in GEO ? se.kind : "grunt";
+    mat = MAT[kind];
+    mesh = new THREE.Mesh(GEO[kind], mat);
+  }
+  mesh.castShadow = true; mesh.position.set(se.x, se.r, se.z); scene.add(mesh);
+  const bar = makeHpBar(clamp(se.r * 2.2, 1.6, isBoss ? 6 : 4));
+  const e = {
+    id, net: true, kind: se.kind, x: se.x, z: se.z, r: se.r, hp: se.hp, maxHp: se.maxHp,
+    dmg: ENEMY_DMG[se.kind] || 9, sc: 0, speed: 0, flash: 0, kx: 0, kz: 0,
+    spin: rand(-2, 2), mesh, bar, mat,
+  };
+  enemies.push(e); netEnemies.set(id, e);
+  return e;
+}
+function removeNetEnemy(id) {
+  const e = netEnemies.get(id); if (!e) return;
+  scene.remove(e.mesh); scene.remove(e.bar);
+  const i = enemies.indexOf(e); if (i >= 0) enemies.splice(i, 1);
+  netEnemies.delete(id);
+}
+// point de dégât unique : en co-op on signale au serveur (autoritaire) ; sinon local.
+function damageEnemy(e, dmg) {
+  e.hp -= dmg;                 // feedback instantané (barre) ; le serveur corrige au sync
+  if (e.net) sendHit(e.id, dmg);
+}
+
+// --- flèches de bord pointant vers les coéquipiers hors champ ---
+let arrowLayer = null;
+const teamArrows = new Map();            // sessionId -> élément DOM
+function ensureArrowLayer() {
+  if (arrowLayer) return arrowLayer;
+  arrowLayer = document.createElement("div");
+  arrowLayer.style.cssText = "position:absolute;inset:0;pointer-events:none;z-index:6;";
+  (document.getElementById("hud") || document.body).appendChild(arrowLayer);
+  return arrowLayer;
+}
+function makeArrow() {
+  const el = document.createElement("div");
+  el.style.cssText =
+    "position:absolute;left:0;top:0;will-change:transform;transition:opacity .15s;" +
+    "font-size:26px;font-weight:900;color:#4fd0ff;text-shadow:0 0 8px #1c7ba0,0 2px 4px #000;";
+  el.textContent = "➤";
+  ensureArrowLayer().appendChild(el);
+  return el;
+}
+const _v = new THREE.Vector3();
+function updateTeammateArrows(room, me) {
+  if (state !== "play") { for (const [, el] of teamArrows) el.style.opacity = "0"; return; }
+  const seen = new Set();
+  const margin = 48;
+  room.state.players.forEach((p, id) => {
+    if (id === me) return;
+    seen.add(id);
+    // on prend la position lissée de l'avatar si dispo (plus stable)
+    const av = remoteAvatars.get(id);
+    _v.set(av ? av.position.x : p.x, 1.2, av ? av.position.z : p.z);
+    _v.project(camera);                  // -> NDC ; z>1 = derrière la caméra
+    let x = _v.x, y = _v.y;
+    const behind = _v.z > 1;
+    if (behind) { x = -x; y = -y; }
+    const onScreen = !behind && Math.abs(x) <= 1 && Math.abs(y) <= 1;
+    let el = teamArrows.get(id);
+    if (onScreen) { if (el) el.style.opacity = "0"; return; }   // à l'écran -> pas de flèche
+    if (!el) { el = makeArrow(); teamArrows.set(id, el); }
+    el.style.opacity = "0.95";
+    // ramène le point sur le bord de l'écran (avec marge)
+    const m = Math.max(Math.abs(x), Math.abs(y)) || 1;
+    const ex = x / m, ey = y / m;
+    const sx = clamp((ex * 0.5 + 0.5) * W, margin, W - margin);
+    const sy = clamp((-ey * 0.5 + 0.5) * H, margin, H - margin);
+    const ang = Math.atan2(-ey, ex) * 180 / Math.PI;            // ➤ pointe vers +x
+    el.style.transform = `translate(-50%,-50%) translate(${sx}px,${sy}px) rotate(${ang}deg)`;
+  });
+  for (const [id, el] of teamArrows) {
+    if (!seen.has(id)) { el.remove(); teamArrows.delete(id); }
+  }
+}
+
 function netSync(now) {
   const room = getRoom();
   if (!room || !room.state) return;
+
+  // 0) pousser la densité de test au serveur si elle a changé
+  if (wantDensity !== sentDensity) { sendDensity(wantDensity); sentDensity = wantDensity; }
 
   // 1) envoyer MA position (throttle à NET_HZ)
   if (player && state === "play" && now - netSendT > 1000 / NET_HZ) {
@@ -626,11 +726,27 @@ function netSync(now) {
     av.rotation.y = -(p.aim || 0) + Math.PI / 2;
     av.visible = (state === "play");
   });
-
-  // 3) retirer les joueurs partis
   for (const [id, av] of remoteAvatars) {
     if (!seen.has(id)) { scene.remove(av); remoteAvatars.delete(id); }
   }
+
+  // 3) refléter la horde autoritaire (positions serveur + interpolation légère)
+  const seenE = new Set();
+  room.state.enemies.forEach((se, id) => {
+    seenE.add(id);
+    let e = netEnemies.get(id) || buildNetEnemy(id, se);
+    e.x += (se.x - e.x) * 0.4;
+    e.z += (se.z - e.z) * 0.4;
+    e.hp = se.hp; e.maxHp = se.maxHp;
+  });
+  for (const id of netEnemies.keys()) if (!seenE.has(id)) removeNetEnemy(id);
+
+  // 4) score & kills partagés (autoritaires)
+  score = room.state.score;
+  kills = room.state.kills;
+
+  // 5) flèches vers les coéquipiers hors champ
+  updateTeammateArrows(room, me);
 }
 
 function update(dt) {
@@ -660,7 +776,8 @@ function update(dt) {
   player.x += mx * player.speed * dt; player.z += mz * player.speed * dt;
 
   // spawn : ennemis normaux jusqu'au boss ; passé le timer, plus de spawn -> boss quand tout est nettoyé
-  if (!boss) {
+  // en co-op : la horde (et le boss) sont pilotés par le serveur -> on désactive le spawn local
+  if (!boss && !inCoop()) {
     if (gameTime < nextBossTime) {
       spawnTimer -= dt;
       const every = Math.max(0.16, 1.1 - gameTime * 0.013);
@@ -700,7 +817,7 @@ function update(dt) {
     for (const e of enemies) {
       const rr = 0.32 + e.r;
       if (dist2(b.x, b.z, e.x, e.z) < rr * rr) {
-        e.hp -= b.dmg; e.flash = 0.08; e.kx += b.vx * 0.02; e.kz += b.vz * 0.02;
+        damageEnemy(e, b.dmg); e.flash = 0.08; e.kx += b.vx * 0.02; e.kz += b.vz * 0.02;
         spawnParticles(b.x, b.z, 0xffffff, 2);
         if (b.pierce > 0) b.pierce--; else { scene.remove(b.mesh); bullets.splice(i, 1); }
         break;
@@ -716,7 +833,7 @@ function update(dt) {
       for (const e of enemies) {
         if (f.hit.has(e)) continue;
         if (dist2(f.x, f.z, e.x, e.z) < (f.r + e.r) ** 2) {
-          e.hp -= f.dmg; e.flash = 0.12; f.hit.add(e); f.bounces--;
+          damageEnemy(e, f.dmg); e.flash = 0.12; f.hit.add(e); f.bounces--;
           spawnParticles(f.x, f.z, 0xb98cff, 6);
           // ricochet : on repart vers l'ennemi le plus proche pas encore touché
           let nx = null, nd = 30 * 30;
@@ -739,14 +856,15 @@ function update(dt) {
   for (let i = enemies.length - 1; i >= 0; i--) {
     const e = enemies[i];
     const a = Math.atan2(player.z - e.z, player.x - e.x);
-    e.x += Math.cos(a) * e.speed * dt + e.kx; e.z += Math.sin(a) * e.speed * dt + e.kz;
-    e.kx *= 0.86; e.kz *= 0.86; if (e.flash > 0) e.flash -= dt;
+    // en co-op, la position vient du serveur (voir netSync) -> pas de déplacement local
+    if (!e.net) { e.x += Math.cos(a) * e.speed * dt + e.kx; e.z += Math.sin(a) * e.speed * dt + e.kz; e.kx *= 0.86; e.kz *= 0.86; }
+    if (e.flash > 0) e.flash -= dt;
     const rr = e.r + player.r;
     if (dist2(e.x, e.z, player.x, player.z) < rr * rr && player.iframe <= 0) {
-      if (player.shield > 0) e.hp = 0;
+      if (player.shield > 0) damageEnemy(e, 99999);
       else { player.hp -= e.dmg; player.iframe = 0.6; shake = 0.5; beep(120,0.15,"sawtooth",0.05); spawnParticles(player.x, player.z, 0xff5555, 8); if (player.hp <= 0) { die(); return; } }
     }
-    if (e.hp <= 0) {
+    if (e.hp <= 0 && !e.net) {
       kills++; score += e.sc;
       if (e.boss) {
         boss = null; nextBossTime = gameTime + bossDelay; toast("💀 BOSS VAINCU !");
@@ -948,8 +1066,15 @@ bossSlider.addEventListener("input", () => {
   const v = +bossSlider.value;
   $("bossVal").textContent = v === 0 ? "Direct" : `${Math.floor(v/60)}:${String(v%60).padStart(2,"0")}`;
 });
-if (!IS_LOCAL) {   // en prod : on cache le curseur de test et l'indice de la touche B
-  const setEl = document.querySelector("#startScreen .setting"); if (setEl) setEl.style.display = "none";
+// curseur de densité d'ennemis (outil de test) : multiplicateur envoyé au serveur
+const densSlider = $("densSlider");
+densSlider.addEventListener("input", () => {
+  const v = +densSlider.value;
+  $("densVal").textContent = v === 0 ? "Aucun" : "✕" + v.toFixed(1);
+  wantDensity = v;   // appliqué en direct : netSync le pousse au serveur au prochain frame
+});
+if (!IS_LOCAL) {   // en prod : on cache les curseurs de test et l'indice de la touche B
+  document.querySelectorAll("#startScreen .setting").forEach(el => el.style.display = "none");
   const keysEl = document.querySelector("#startScreen .keys"); if (keysEl) keysEl.innerHTML = keysEl.innerHTML.replace(" · B : boss immédiat", "");
 }
 // détection tactile -> instructions adaptées au mobile

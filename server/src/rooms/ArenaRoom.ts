@@ -3,10 +3,10 @@ import { ArenaState, Player, Enemy } from "../schema/ArenaState";
 
 const TICK_MS = 50; // simulation à 20 Hz
 const MAX_ENEMIES = 220; // garde-fou (serveur Node mono-thread)
+const BASE_CAP = 100; // population cible à densité ✕1 (cap = BASE_CAP * densité)
 
 type EnemyType = { kind: string; r: number; speed: number; hp: number; dmg: number; sc: number };
 
-// Réplique fidèlement enemyType() du client : le type dépend du temps écoulé.
 function rollEnemyType(elapsed: number): EnemyType {
   const r = Math.random();
   if (elapsed > 55 && r < 0.15) return { kind: "brute", r: 2.0, speed: 3.9, hp: 70 + elapsed * 1.3, dmg: 24, sc: 50 };
@@ -14,59 +14,84 @@ function rollEnemyType(elapsed: number): EnemyType {
   return { kind: "grunt", r: 1.1, speed: 5.4, hp: 22 + elapsed * 0.7, dmg: 9, sc: 10 };
 }
 
-// L'arène partagée — Jalon 4 : horde AUTORITAIRE côté serveur.
+function clampNum(v: unknown, lo: number, hi: number, def: number): number {
+  const n = typeof v === "number" && isFinite(v) ? v : def;
+  return Math.max(lo, Math.min(hi, n));
+}
+
+// L'arène partagée — horde AUTORITAIRE côté serveur.
+// Les paramètres (densité, délai boss) appartiennent à l'HÔTE (1er joueur).
 export class ArenaRoom extends Room<ArenaState> {
   maxClients = 4;
 
-  private spawnAcc = 0; // accumulateur de cadence de spawn
-  private seq = 0; // compteur d'ids d'ennemis
-  private meta = new Map<string, { speed: number; sc: number }>(); // par ennemi, non répliqué
+  private spawnAcc = 0;
+  private seq = 0;
+  private meta = new Map<string, { speed: number; sc: number }>();
+  private hostId: string | null = null; // 1er joueur = définit/modifie les params
+  private density = 1; // 0..2
+  private bossDelay = 300; // s avant le boss (0 = direct)
+  private nextBoss = 300;
+  private bossId: string | null = null;
 
-  onCreate() {
+  onCreate(options?: { density?: number; bossDelay?: number }) {
     this.setState(new ArenaState());
+    // paramètres définis par le joueur qui instancie la room
+    this.density = clampNum(options?.density, 0, 2, 1);
+    this.bossDelay = clampNum(options?.bossDelay, 0, 300, 300);
+    this.nextBoss = this.bossDelay;
 
-    // présence : position du joueur
     this.onMessage("pos", (client, d: { x: number; z: number; aim: number }) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
-      p.x = d.x;
-      p.z = d.z;
-      p.aim = d.aim;
+      p.x = d.x; p.z = d.z; p.aim = d.aim;
     });
 
-    // dégâts : le client détecte la collision balle/ennemi (réactif) et signale.
-    // Le serveur reste AUTORITAIRE sur les hp et la mort (pas de triche en co-op PvE).
     this.onMessage("hit", (_client, d: { id: string; dmg: number }) => {
       const e = this.state.enemies.get(d.id);
       if (!e) return;
       e.hp -= d.dmg;
-      if (e.hp <= 0) {
-        const m = this.meta.get(d.id);
-        this.state.kills++;
-        this.state.score += m ? m.sc : 10;
-        this.state.enemies.delete(d.id);
-        this.meta.delete(d.id);
-      }
+      if (e.hp <= 0) this.killEnemy(d.id);
+    });
+
+    // seul l'hôte peut modifier les params en cours de partie (outil de test)
+    this.onMessage("density", (client, d: { d: number }) => {
+      if (client.sessionId !== this.hostId) return;
+      this.density = clampNum(d?.d, 0, 2, 1);
+    });
+    this.onMessage("bossDelay", (client, d: { d: number }) => {
+      if (client.sessionId !== this.hostId) return;
+      this.bossDelay = clampNum(d?.d, 0, 300, 300);
+      if (!this.bossId) this.nextBoss = this.bossDelay;
     });
 
     this.setSimulationInterval((dtMs) => this.tick(dtMs / 1000), TICK_MS);
-    console.log(`[arena] room créée: ${this.roomId}`);
+    console.log(`[arena] room créée: ${this.roomId} (densité ✕${this.density}, boss ${this.bossDelay}s)`);
   }
 
   private tick(dt: number) {
     const players = [...this.state.players.values()];
-    if (players.length === 0) return; // pas de cible -> pas de horde
-
+    if (players.length === 0) return;
     this.state.elapsed += dt;
 
-    // --- spawn (même cadence que le solo) ---
-    this.spawnAcc -= dt;
-    if (this.spawnAcc <= 0 && this.state.enemies.size < MAX_ENEMIES) {
-      this.spawnAcc = Math.max(0.16, 1.1 - this.state.elapsed * 0.013);
-      this.spawnEnemy(players);
+    if (!this.bossId) {
+      // phase horde normale, pilotée par la densité (cap + taux de spawn)
+      const cap = Math.min(MAX_ENEMIES, Math.round(BASE_CAP * this.density));
+      if (this.state.enemies.size > cap) {
+        const ids = [...this.state.enemies.keys()];
+        for (let k = cap; k < ids.length; k++) this.killEnemy(ids[k], true); // culling silencieux
+      }
+      if (this.state.elapsed < this.nextBoss) {
+        this.spawnAcc -= dt;
+        if (this.spawnAcc <= 0 && this.state.enemies.size < cap) {
+          this.spawnAcc = Math.max(0.16, 1.1 - this.state.elapsed * 0.013) / Math.max(0.25, this.density);
+          this.spawnEnemy(players);
+        }
+      } else if (this.state.enemies.size === 0) {
+        this.spawnBoss(players);
+      }
     }
 
-    // --- IA : chaque ennemi fonce vers le joueur le plus proche ---
+    // IA : tous les ennemis (boss inclus) foncent vers le joueur le plus proche
     this.state.enemies.forEach((e, id) => {
       let tx = e.x, tz = e.z, best = Infinity;
       for (const p of players) {
@@ -88,16 +113,43 @@ export class ArenaRoom extends Room<ArenaState> {
     const e = new Enemy();
     e.x = anchor.x + Math.cos(a) * 44;
     e.z = anchor.z + Math.sin(a) * 44;
-    e.r = t.r;
-    e.hp = t.hp;
-    e.maxHp = t.hp;
-    e.kind = t.kind;
+    e.r = t.r; e.hp = t.hp; e.maxHp = t.hp; e.kind = t.kind;
     const id = "e" + this.seq++;
     this.state.enemies.set(id, e);
     this.meta.set(id, { speed: t.speed, sc: t.sc });
   }
 
+  private spawnBoss(players: Player[]) {
+    const anchor = players[(Math.random() * players.length) | 0];
+    const a = Math.random() * Math.PI * 2;
+    const hp = 3500 + this.state.elapsed * 8;
+    const e = new Enemy();
+    e.x = anchor.x + Math.cos(a) * 46;
+    e.z = anchor.z + Math.sin(a) * 46;
+    e.r = 5; e.hp = hp; e.maxHp = hp; e.kind = "boss";
+    const id = "boss" + this.seq++;
+    this.state.enemies.set(id, e);
+    this.meta.set(id, { speed: 4.6, sc: 1500 });
+    this.bossId = id;
+    console.log(`[arena] boss spawn (${this.roomId})`);
+  }
+
+  private killEnemy(id: string, culled = false) {
+    if (!this.state.enemies.has(id)) return;
+    if (!culled) {
+      this.state.kills++;
+      this.state.score += this.meta.get(id)?.sc ?? 10;
+    }
+    this.state.enemies.delete(id);
+    this.meta.delete(id);
+    if (id === this.bossId) {
+      this.bossId = null;
+      this.nextBoss = this.state.elapsed + this.bossDelay; // boss récurrent, comme le solo
+    }
+  }
+
   onJoin(client: Client, options?: { name?: string }) {
+    if (!this.hostId) this.hostId = client.sessionId; // 1er joueur = hôte
     const p = new Player();
     p.name = (options?.name ?? "Joueur").slice(0, 12);
     this.state.players.set(client.sessionId, p);
