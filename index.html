@@ -124,6 +124,9 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 // ============================================================
 const LEADERBOARD = { supabaseUrl: "", supabaseKey: "" };
 
+// Outils de test (curseur délai boss + touche B) : visibles UNIQUEMENT en local, pas en prod
+const IS_LOCAL = ["localhost", "127.0.0.1", ""].includes(location.hostname);
+
 // ---------- utils ----------
 const rand = (a, b) => a + Math.random() * (b - a);
 const pick = arr => arr[(Math.random() * arr.length) | 0];
@@ -470,7 +473,7 @@ function startGame() {
   enemies = []; bullets = []; pickups = []; effects = []; particles = []; enemyBullets = [];
   gameTime = 0; spawnTimer = 0; kills = 0; score = 0; armed = -1; shake = 0; scoreSaved = false;
   const sl = document.getElementById("bossSlider");
-  bossDelay = sl ? +sl.value : BOSS_TIME;
+  bossDelay = (IS_LOCAL && sl) ? +sl.value : BOSS_TIME;
   boss = null; nextBossTime = bossDelay;
   document.getElementById("startScreen").classList.add("hidden");
   document.getElementById("deathScreen").classList.add("hidden");
@@ -488,7 +491,7 @@ window.addEventListener("keydown", e => {
   if (e.code === "KeyM") soundOn = !soundOn;
   if (e.code === "KeyP" && (state === "play" || state === "pause")) togglePause();
   if (e.code === "KeyR" && state === "dead") startGame();
-  if (e.code === "KeyB" && state === "play" && !boss) {   // debug : boss tout de suite
+  if (e.code === "KeyB" && IS_LOCAL && state === "play" && !boss) {   // debug local : boss tout de suite
     nextBossTime = gameTime;
     for (const en of enemies) { scene.remove(en.mesh); scene.remove(en.bar); }
     enemies.length = 0;
@@ -961,6 +964,10 @@ bossSlider.addEventListener("input", () => {
   const v = +bossSlider.value;
   $("bossVal").textContent = v === 0 ? "Direct" : `${Math.floor(v/60)}:${String(v%60).padStart(2,"0")}`;
 });
+if (!IS_LOCAL) {   // en prod : on cache le curseur de test et l'indice de la touche B
+  const setEl = document.querySelector("#startScreen .setting"); if (setEl) setEl.style.display = "none";
+  const keysEl = document.querySelector("#startScreen .keys"); if (keysEl) keysEl.innerHTML = keysEl.innerHTML.replace(" · B : boss immédiat", "");
+}
 $("startBtn").onclick = () => { if (!AC) try { AC = new (window.AudioContext||window.webkitAudioContext)(); } catch(e){} startGame(); };
 $("againBtn").onclick = startGame;
 $("saveBtn").onclick = saveAndShow;
