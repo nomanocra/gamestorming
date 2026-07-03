@@ -458,7 +458,7 @@ let boss = null, enemyBullets = [], nextBossTime = BOSS_TIME, bossDelay = BOSS_T
 function newPlayer() {
   return { x: 0, z: 0, r: 1.2, baseSpeed: 16, iframe: 0, hp: 100, maxHp: 100,
     weaponLvl: { pistolet: 1 }, weapon: computeWeapon("pistolet", 1), fireT: 0, inv: [null, null, null],
-    shield: 0, speedBuff: 0, frenzy: 0, face: 0,
+    shield: 0, speedBuff: 0, frenzy: 0, face: 0, moveTarget: null,
     get speed() { return this.baseSpeed * (this.speedBuff > 0 ? 1.6 : 1); } };
 }
 function clearGroup(list) { for (const e of list) { if (e.mesh) scene.remove(e.mesh); if (e.bar) scene.remove(e.bar); } }
@@ -508,16 +508,20 @@ const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 renderer.domElement.addEventListener("mousemove", e => {
   mouseNDC.x = (e.clientX / W) * 2 - 1; mouseNDC.y = -(e.clientY / H) * 2 + 1;
 });
-renderer.domElement.addEventListener("mousedown", () => {
-  if (state !== "play" || armed === -1) return;
+// pointerdown = souris ET tactile : objet armé -> activer ici ; sinon -> se déplacer ici
+renderer.domElement.addEventListener("pointerdown", e => {
+  if (state !== "play" || !player) return;
+  mouseNDC.x = (e.clientX / W) * 2 - 1; mouseNDC.y = -(e.clientY / H) * 2 + 1;
   const hit = new THREE.Vector3();
   raycaster.setFromCamera(mouseNDC, camera);
-  if (raycaster.ray.intersectPlane(groundPlane, hit)) useItem(armed, hit.x, hit.z);
+  if (!raycaster.ray.intersectPlane(groundPlane, hit)) return;
+  if (armed !== -1) useItem(armed, hit.x, hit.z);
+  else player.moveTarget = { x: hit.x, z: hit.z };
 });
 
-// slots cliquables
+// slots cliquables (tap sur mobile)
 document.querySelectorAll(".slot").forEach(el => {
-  el.addEventListener("mousedown", () => { if (state === "play") armSlot(+el.dataset.i); });
+  el.addEventListener("pointerdown", () => { if (state === "play") armSlot(+el.dataset.i); });
 });
 function togglePause() { if (state === "play") state = "pause"; else if (state === "pause") { state = "play"; lastT = performance.now(); } }
 
@@ -681,6 +685,12 @@ function update(dt) {
   if (keys["KeyS"] || keys["ArrowDown"]) { mx -= fwd.x; mz -= fwd.z; }
   if (keys["KeyD"] || keys["ArrowRight"]) { mx += right.x; mz += right.z; }
   if (keys["KeyA"] || keys["ArrowLeft"]) { mx -= right.x; mz -= right.z; }
+  // tactile / clic : si pas de clavier, on se dirige vers le point tapé
+  if (mx !== 0 || mz !== 0) player.moveTarget = null;   // le clavier annule la cible
+  else if (player.moveTarget) {
+    const ddx = player.moveTarget.x - player.x, ddz = player.moveTarget.z - player.z, dl = Math.hypot(ddx, ddz);
+    if (dl > 0.8) { mx = ddx; mz = ddz; } else player.moveTarget = null;   // arrivé
+  }
   const ml = Math.hypot(mx, mz);
   player.moving = ml > 0.001;
   if (ml > 0) { mx /= ml; mz /= ml; player.face = Math.atan2(mx, mz); }
@@ -967,6 +977,12 @@ bossSlider.addEventListener("input", () => {
 if (!IS_LOCAL) {   // en prod : on cache le curseur de test et l'indice de la touche B
   const setEl = document.querySelector("#startScreen .setting"); if (setEl) setEl.style.display = "none";
   const keysEl = document.querySelector("#startScreen .keys"); if (keysEl) keysEl.innerHTML = keysEl.innerHTML.replace(" · B : boss immédiat", "");
+}
+// détection tactile -> instructions adaptées au mobile
+const IS_TOUCH = ("ontouchstart" in window) || navigator.maxTouchPoints > 0;
+if (IS_TOUCH) {
+  const k = document.querySelector("#startScreen .keys");
+  if (k) k.innerHTML = "👆 Tape sur le sol pour te déplacer<br>Objets : tape un slot, puis tape où viser<br>Le tir est automatique";
 }
 $("startBtn").onclick = () => { if (!AC) try { AC = new (window.AudioContext||window.webkitAudioContext)(); } catch(e){} startGame(); };
 $("againBtn").onclick = startGame;
