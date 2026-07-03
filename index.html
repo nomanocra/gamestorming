@@ -507,19 +507,30 @@ window.addEventListener("keyup", e => { keys[e.code] = false; });
 let mouseNDC = new THREE.Vector2(0, 0);
 const raycaster = new THREE.Raycaster();
 const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-renderer.domElement.addEventListener("mousemove", e => {
+let dragging = false;
+function pointerToGround(e, out) {   // met à jour la visée + renvoie le point au sol sous le doigt/souris
   mouseNDC.x = (e.clientX / W) * 2 - 1; mouseNDC.y = -(e.clientY / H) * 2 + 1;
-});
-// pointerdown = souris ET tactile : objet armé -> activer ici ; sinon -> se déplacer ici
+  raycaster.setFromCamera(mouseNDC, camera);
+  return raycaster.ray.intersectPlane(groundPlane, out);
+}
+// pointerdown : objet armé -> activer ici ; sinon -> déplacement + on démarre le "drag"
 renderer.domElement.addEventListener("pointerdown", e => {
   if (state !== "play" || !player) return;
-  mouseNDC.x = (e.clientX / W) * 2 - 1; mouseNDC.y = -(e.clientY / H) * 2 + 1;
   const hit = new THREE.Vector3();
-  raycaster.setFromCamera(mouseNDC, camera);
-  if (!raycaster.ray.intersectPlane(groundPlane, hit)) return;
-  if (armed !== -1) useItem(armed, hit.x, hit.z);
-  else player.moveTarget = { x: hit.x, z: hit.z };
+  if (!pointerToGround(e, hit)) return;
+  if (armed !== -1) { useItem(armed, hit.x, hit.z); return; }
+  dragging = true;
+  try { renderer.domElement.setPointerCapture(e.pointerId); } catch (_) {}
+  player.moveTarget = { x: hit.x, z: hit.z };
 });
+// pointermove : le perso suit le doigt tant qu'il est maintenu (drag), sinon met juste à jour la visée
+renderer.domElement.addEventListener("pointermove", e => {
+  const hit = new THREE.Vector3();
+  if (!pointerToGround(e, hit)) return;
+  if (dragging && armed === -1 && state === "play" && player) player.moveTarget = { x: hit.x, z: hit.z };
+});
+window.addEventListener("pointerup", () => { dragging = false; });
+window.addEventListener("pointercancel", () => { dragging = false; });
 
 // slots cliquables (tap sur mobile)
 document.querySelectorAll(".slot").forEach(el => {
