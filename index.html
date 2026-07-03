@@ -309,6 +309,7 @@ const aimPoint = new THREE.Vector3();
 function updateAimPreview() {
   bombPrev.visible = laserPrev.visible = grenadePrev.visible = false;
   if (state !== "play" || armed === -1 || !player) return;
+  if (IS_TOUCH && !aiming) return;   // sur tactile : preview seulement quand le doigt vise
   const key = player.inv[armed]; if (!key) return;
   camera.updateMatrixWorld();
   raycaster.setFromCamera(mouseNDC, camera);
@@ -507,30 +508,36 @@ window.addEventListener("keyup", e => { keys[e.code] = false; });
 let mouseNDC = new THREE.Vector2(0, 0);
 const raycaster = new THREE.Raycaster();
 const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-let dragging = false;
+let dragging = false, aiming = false;
 function pointerToGround(e, out) {   // met à jour la visée + renvoie le point au sol sous le doigt/souris
   mouseNDC.x = (e.clientX / W) * 2 - 1; mouseNDC.y = -(e.clientY / H) * 2 + 1;
   raycaster.setFromCamera(mouseNDC, camera);
   return raycaster.ray.intersectPlane(groundPlane, out);
 }
-// pointerdown : objet armé -> activer ici ; sinon -> déplacement + on démarre le "drag"
+// pointerdown : objet armé -> on VISE (preview qui suit le doigt) ; sinon -> déplacement (drag)
 renderer.domElement.addEventListener("pointerdown", e => {
   if (state !== "play" || !player) return;
   const hit = new THREE.Vector3();
   if (!pointerToGround(e, hit)) return;
-  if (armed !== -1) { useItem(armed, hit.x, hit.z); return; }
-  dragging = true;
   try { renderer.domElement.setPointerCapture(e.pointerId); } catch (_) {}
-  player.moveTarget = { x: hit.x, z: hit.z };
+  if (armed !== -1) { aiming = true; }                       // le tir se fera au relâchement
+  else { dragging = true; player.moveTarget = { x: hit.x, z: hit.z }; }
 });
-// pointermove : le perso suit le doigt tant qu'il est maintenu (drag), sinon met juste à jour la visée
+// pointermove : met à jour la visée (le preview suit le doigt) ; en drag, le perso suit le doigt
 renderer.domElement.addEventListener("pointermove", e => {
   const hit = new THREE.Vector3();
   if (!pointerToGround(e, hit)) return;
   if (dragging && armed === -1 && state === "play" && player) player.moveTarget = { x: hit.x, z: hit.z };
 });
-window.addEventListener("pointerup", () => { dragging = false; });
-window.addEventListener("pointercancel", () => { dragging = false; });
+// pointerup : si on visait un objet -> on le lance à l'endroit relâché
+window.addEventListener("pointerup", e => {
+  if (aiming && armed !== -1 && state === "play" && player) {
+    const hit = new THREE.Vector3();
+    if (pointerToGround(e, hit)) useItem(armed, hit.x, hit.z);
+  }
+  dragging = false; aiming = false;
+});
+window.addEventListener("pointercancel", () => { dragging = false; aiming = false; });
 
 // slots cliquables (tap sur mobile)
 document.querySelectorAll(".slot").forEach(el => {
