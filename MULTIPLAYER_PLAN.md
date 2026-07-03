@@ -3,6 +3,14 @@
 > Objectif final : co-op temps réel 4 joueurs, serveur autoritaire.
 > Ce document est la feuille de route. On avance jalon par jalon.
 
+## Avancement
+- ✅ **Jalon 0** — fondations (workspaces, git, TS) — *fait, commit 714ada8*
+- ✅ **Jalon 1** — présence 4 joueurs — *fait & validé end-to-end, commit 714ada8*
+- 🟡 **Jalon 2** — déploiement — *config prête (Docker/Fly/Vercel + DEPLOY.md) ; push = comptes utilisateur*
+- ⬜ **Jalon 3** — auth & progression (Supabase)
+- ⬜ **Jalon 4** — co-op réel (horde autoritaire) ← prochaine grosse étape
+- ⬜ **Jalon 5** — bandwidth & scaling (Redis)
+
 ## Hypothèses de départ (à confirmer)
 
 Ces choix ont été pris par défaut (questions restées sans réponse) — corrigeables :

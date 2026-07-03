@@ -1,0 +1,17 @@
+# Config Fly.io pour le serveur Colyseus.
+# ⚠️ "app" doit être unique sur Fly — change-le, ou laisse `fly launch` le générer.
+app = "horde-survivor-server"
+primary_region = "cdg" # Paris ; mets la région la plus proche de tes joueurs
+
+[build]
+
+[http_service]
+  internal_port = 2567
+  force_https = true        # -> le client se connecte en wss://
+  auto_stop_machines = true # s'endort si inactif (économie) ; se réveille à la connexion
+  auto_start_machines = true
+  min_machines_running = 0  # 0 = coût quasi nul au repos (léger cold-start au réveil)
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"          # large pour de la présence ; à monter pour la horde autoritaire
