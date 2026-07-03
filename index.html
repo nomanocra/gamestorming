@@ -441,6 +441,8 @@ const BUFFS = {
   soin:    { ico:"❤️", col:0xff6a6a, apply:p => p.hp = Math.min(p.maxHp, p.hp + 40) },
 };
 const BUFF_KEYS = Object.keys(BUFFS);
+// pioche pondérée : le soin (vie) est ~2x plus rare que les autres buffs
+const BUFF_POOL = ["bouclier", "bouclier", "vitesse", "vitesse", "frenesie", "frenesie", "soin"];
 
 // ============================================================
 //  ÉTAT
@@ -597,7 +599,7 @@ function spawnEnemyBullet(x, z, ang, speed, dmg) {
   enemyBullets.push({ x, z, vx: Math.cos(ang) * speed, vz: Math.sin(ang) * speed, life: 4, dmg, mesh: m });
 }
 function dropRandom(x, z) {
-  const table = [["weapon", WEAPON_KEYS], ["item", ITEM_KEYS], ["buff", BUFF_KEYS]];
+  const table = [["weapon", WEAPON_KEYS], ["item", ITEM_KEYS], ["buff", BUFF_POOL]];
   const [kind, keys] = pick(table); dropPickup(x, z, kind, pick(keys));
 }
 function keyOf(weapon) { return WEAPON_KEYS.find(k => BASE_WEAPONS[k].name === weapon.name); }
@@ -605,7 +607,7 @@ function rollDrop(x, z) {
   const r = Math.random();
   if (r < 0.05) dropPickup(x, z, "weapon", pick(WEAPON_KEYS));   // n'importe quelle arme (dont l'actuelle -> lvl up)
   else if (r < 0.13) dropPickup(x, z, "item", pick(ITEM_KEYS));
-  else if (r < 0.30) dropPickup(x, z, "buff", pick(BUFF_KEYS));
+  else if (r < 0.30) dropPickup(x, z, "buff", pick(BUFF_POOL));
 }
 function dropPickup(x, z, kind, key) {
   let col, ico;
