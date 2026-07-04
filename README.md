@@ -1,35 +1,51 @@
-# Gamestorming — Horde Survivor (prototype)
+# Gamestorming — Horde Survivor
 
-Prototype d'un jeu de survie type *horde survivor* en **3D isométrique** (Three.js) : low-poly, éclairage soigné, bloom néon.
+Jeu de survie type *horde survivor* en **3D** (Three.js), **co-op multijoueur** (jusqu'à 4 joueurs) avec serveur autoritaire (Colyseus).
+
+**🎮 En ligne : https://gamestorming.fly.dev**
 
 ## Concept
 
 - Vue 3D iso, personnage (barbare) qui court, **compagnon volant** qui tire automatiquement l'ennemi le plus proche.
-- **Monde infini** généré par chunks (façon Minecraft) : plus tu avances, plus le monde se génère.
-- **Loot au sol** : armes (qui montent en niveau si on les recupère), buffs instantanés (bouclier, vitesse, soin, frénésie), objets actifs visés à la souris (bombe, laser, ricochet — 3 slots).
-- **Boss** : à la fin d'un timer réglable, les spawns s'arrêtent puis un boss géant apparaît et canarde le joueur.
-- **Score + classement** (local, ou mondial via Supabase — voir `LEADERBOARD` dans `index.html`).
+- **Co-op temps réel** : les joueurs affrontent la **même horde** (ennemis, score et kills partagés, boss commun). Flèches de bord indiquant les coéquipiers hors champ.
+- **Monde infini** généré par chunks : plus tu avances, plus le monde se génère.
+- **Loot au sol** : armes (qui montent en niveau), buffs (bouclier, vitesse, soin, frénésie), objets actifs visés à la souris (bombe, laser, ricochet — 3 slots).
+- **Boss** : après un délai réglable (par l'hôte), un boss géant apparaît.
+- Solo jouable en repli automatique si le serveur est injoignable.
 
-## Lancer le jeu
+## Architecture
 
-La 3D charge Three.js en modules ES → il faut un petit serveur local (le double-clic sur le fichier ne suffit pas) :
+Monorepo (npm workspaces) :
+
+- **`client/`** — Three.js + Vite. Le jeu ; la simulation locale + le rendu + la couche réseau (`src/net/room.ts`).
+- **`server/`** — Colyseus + Node/TypeScript. Horde **autoritaire** (spawn, IA, dégâts, boss), paramètres (densité, délai boss) définis par l'hôte.
+
+En prod, le serveur sert **aussi** le jeu en statique → une seule URL sert le jeu et le WebSocket.
+
+## Lancer en local
 
 ```bash
-python3 -m http.server 8000
+npm install
+npm run dev        # client sur :5173 + serveur Colyseus sur :2567
 ```
 
-Puis ouvrir **http://localhost:8000/index.html**.
+Puis ouvrir **http://localhost:5173** (deux onglets pour tester le co-op).
 
 ## Contrôles
 
-- **WASD / flèches** : déplacement (ZQSD sur AZERTY — basé sur la position physique des touches)
+- **WASD / flèches** : déplacement (ZQSD sur AZERTY)
 - **1 / 2 / 3** ou **clic sur un slot** : armer un objet, puis **clic au sol** pour viser
-- **M** : son · **P** : pause · **B** : faire apparaître le boss immédiatement
+- **M** : son · **P** : pause · **B** (local) : boss immédiat
+- Curseurs **densité d'ennemis** et **délai boss** au menu (visibles en local uniquement, outils de test)
+
+## Déploiement
+
+Auto : **`git push` sur `main`** → GitHub Actions → `flyctl deploy` sur Fly.io. Voir `DEPLOY.md`.
 
 ## Assets
 
-- `assets/Barbarian.glb` — personnage low-poly, KayKit (Kay Lousberg), licence **CC0**.
+- `client/public/assets/Barbarian.glb` — personnage low-poly, KayKit (Kay Lousberg), licence **CC0**.
 
 ## Stack
 
-Three.js (r160), rendu WebGL + post-processing (UnrealBloom), aucune étape de build — un seul fichier `index.html`.
+Three.js (r160) · Colyseus 0.15 · Vite · Fly.io · GitHub Actions.

@@ -1,60 +1,46 @@
 # Déploiement
 
-Architecture : **client statique sur Vercel** + **serveur Colyseus sur Fly.io**.
+Tout tourne sur **un seul host : Fly.io** (app `gamestorming`). Le serveur Colyseus
+sert à la fois le jeu (statique) et le WebSocket → une seule URL :
+**https://gamestorming.fly.dev**.
 
-> ⚠️ Les étapes `login`/`deploy` demandent TES comptes (je ne peux pas les créer).
-> Tape-les toi-même dans le terminal (préfixe `! ` dans Claude Code pour les exécuter ici).
+## Déploiement automatique (normal)
 
-## 1. Serveur Colyseus → Fly.io
+**`git push` sur `main`** suffit :
 
-Prérequis : compte Fly.io + `flyctl` installé (`brew install flyctl`).
+1. GitHub Actions (`.github/workflows/fly-deploy.yml`) se déclenche
+2. il lance `flyctl deploy` avec le secret `FLY_API_TOKEN`
+3. Fly build l'image (`server/Dockerfile` : build client Vite + serveur, l'image
+   finale sert `./public` + le WebSocket) et déploie
+
+Suivre un déploiement : `gh run list` ou l'onglet **Actions** du repo.
+
+## Déploiement manuel (dépannage / test rapide)
+
+Depuis la racine, avec `flyctl` connecté (`flyctl auth login`) :
 
 ```bash
-cd server
-fly auth login                 # ouvre le navigateur
-fly launch --no-deploy         # détecte le Dockerfile + fly.toml (change le nom d'app si pris)
-fly deploy
+flyctl deploy          # utilise ./fly.toml (app gamestorming, région cdg)
 ```
 
-À la fin, note l'URL publique, ex : `https://horde-survivor-server.fly.dev`.
-Le client s'y connectera en **wss://** (le `force_https` du fly.toml s'en charge).
+⚠️ Le manuel déploie tes fichiers **locaux** (même non commités). Pour la prod, préfère le push.
 
-Vérif : `curl https://<ton-app>.fly.dev/` doit répondre `Horde Survivor — serveur Colyseus OK`.
+## Config
 
-## 2. Client → Vercel
+- **`fly.toml`** (racine) : app, région Paris (`cdg`), `http_service` (wss, veille auto).
+- **`server/Dockerfile`** : multi-stage, contexte = racine du repo.
+- Le serveur écoute sur `process.env.PORT` (Fly l'injecte).
+- Machines en **scale-to-zero** (`min_machines_running = 0`) : coût quasi nul au repos,
+  cold-start ~qq secondes au réveil du 1er joueur.
 
-Prérequis : compte Vercel + `vercel` CLI (`npm i -g vercel`).
+## Coût
 
-```bash
-cd client
-vercel                         # login + 1er déploiement (preview)
-```
+Fly, usage réel : **~0 $** tant que personne ne joue (veille auto). Suivi : dashboard Fly → **Billing → Cost Explorer**.
 
-Dans le dashboard Vercel du projet (ou au prompt CLI) :
-- **Root Directory** = `client`
-- **Framework** = Vite (auto-détecté)
-- **Variable d'environnement** : `VITE_SERVER_URL = wss://<ton-app>.fly.dev`
-  (⚠️ variable de *build* : re-déploie après l'avoir ajoutée)
+## Secret CI (une fois)
 
-Puis en prod :
-```bash
-vercel --prod
-```
-
-## 3. Comment ça se relie
-
-- Le client lit `VITE_SERVER_URL` (voir `client/src/net/room.ts`). Absente → il tente
-  `ws://<hostname>:2567` (pratique en local, inutile en prod).
-- CORS est déjà activé côté serveur (`app.use(cors())`) pour le matchmaking HTTP.
-
-## Coûts (ordre de grandeur, prototype)
-
-- **Vercel** : gratuit (statique).
-- **Fly.io** : ~gratuit au repos (`min_machines_running = 0`), quelques $/mois en usage.
-  Monte `memory` dans `fly.toml` quand la horde deviendra autoritaire (Jalon 4).
-
-## Local (rappel)
+Le workflow a besoin du secret `FLY_API_TOKEN` :
 
 ```bash
-npm run dev   # client :5173 + serveur :2567
+flyctl tokens create deploy | gh secret set FLY_API_TOKEN -R nomanocra/gamestorming
 ```
