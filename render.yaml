@@ -1,0 +1,16 @@
+# Blueprint Render — déploie le serveur Colyseus (Docker) depuis ce repo.
+# Utilisation : Render → New → Blueprint → choisir le repo → Apply.
+# Le plan "free" s'endort après ~15 min d'inactivité (cold-start ~30-50 s).
+services:
+  - type: web
+    name: horde-survivor-server
+    runtime: docker
+    repo: https://github.com/nomanocra/gamestorming
+    branch: main
+    dockerfilePath: ./server/Dockerfile
+    dockerContext: ./server
+    plan: free
+    region: frankfurt
+    healthCheckPath: /
+    # Render injecte automatiquement la variable PORT ; le serveur la lit
+    # (process.env.PORT) et écoute dessus. Rien d'autre à configurer.
