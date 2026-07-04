@@ -1,0 +1,17 @@
+# Config Fly.io — sert à la fois le JEU (statique) et le serveur Colyseus.
+app = "gamestorming"
+primary_region = "cdg" # Paris
+
+[build]
+  dockerfile = "server/Dockerfile" # contexte de build = racine du repo
+
+[http_service]
+  internal_port = 2567
+  force_https = true        # -> le client se connecte en wss://
+  auto_stop_machines = true # s'endort si inactif (économie) ; se réveille à la connexion
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

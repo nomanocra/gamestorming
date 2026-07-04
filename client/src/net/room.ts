@@ -10,13 +10,13 @@ let room: Room | null = null;
 let connecting = false;
 
 function endpoint(): string {
-  // Prod : défini via VITE_SERVER_URL (ex: wss://mon-serveur.fly.dev).
-  // Local : même hôte que la page, port 2567.
+  // Optionnel : forcer une URL via VITE_SERVER_URL.
   const fromEnv = (import.meta as any).env?.VITE_SERVER_URL;
   if (fromEnv) return fromEnv;
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const host = location.hostname || "localhost";
-  return `${proto}://${host}:2567`;
+  // Prod (https) : le jeu est servi PAR le serveur -> même origine, pas de port.
+  if (location.protocol === "https:") return `wss://${location.host}`;
+  // Dev local : client sur :5173, serveur Colyseus sur :2567.
+  return `ws://${location.hostname || "localhost"}:2567`;
 }
 
 export function getRoom(): Room | null {

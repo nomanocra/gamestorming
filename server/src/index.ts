@@ -1,4 +1,5 @@
 import { createServer } from "http";
+import path from "path";
 import express from "express";
 import cors from "cors";
 import { Server } from "colyseus";
@@ -8,10 +9,12 @@ import { ArenaRoom } from "./rooms/ArenaRoom";
 const port = Number(process.env.PORT ?? 2567);
 
 const app = express();
-app.use(cors()); // autorise le client (autre origine/port) à faire le matchmaking HTTP
-app.get("/", (_req, res) => {
-  res.send("Horde Survivor — serveur Colyseus OK");
-});
+app.use(cors()); // utile en dev (client :5173 -> serveur :2567) ; inoffensif en prod
+// Sert le jeu (client Vite buildé, copié dans ./public par le Dockerfile).
+// -> gamestorming.fly.dev sert à la fois le JEU et le WebSocket (même origine).
+// Les requêtes /matchmake ne matchent aucun fichier et passent à Colyseus.
+app.use(express.static(path.join(__dirname, "..", "public")));
+app.get("/healthz", (_req, res) => res.send("ok"));
 
 const gameServer = new Server({
   // Transport explicite avec heartbeat : indispensable pour détecter les
