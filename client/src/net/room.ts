@@ -11,6 +11,8 @@ let room: Room | null = null;
 let connecting = false;
 // callback rendu (game.js) appelé quand un AUTRE joueur tire / lance un objet
 let shotCb: ((d: any) => void) | null = null;
+// callback (game.js) appelé quand le serveur CONFIRME un ramassage de butin -> applique l'effet
+let grabbedCb: ((d: any) => void) | null = null;
 
 // Métadonnées d'une partie affichées dans la liste (lobby), avant de rejoindre.
 export type PartyInfo = {
@@ -51,6 +53,8 @@ function wireRoom(r: Room): void {
   room = r;
   // projectiles cosmétiques diffusés par les autres joueurs
   r.onMessage("shot", (d: any) => shotCb?.(d));
+  // confirmation serveur d'un ramassage de butin (effet réservé au ramasseur)
+  r.onMessage("grabbed", (d: any) => grabbedCb?.(d));
   r.onError((code, message) => console.warn("[net] erreur room:", code, message));
   r.onLeave(() => {
     console.log("[net] quitté l'arène");
@@ -136,6 +140,16 @@ export function sendShot(d: any): void {
 // Enregistre le rendu des projectiles distants (game.js possède THREE + la scène).
 export function onShot(cb: (d: any) => void): void {
   shotCb = cb;
+}
+
+// Demande au serveur de ramasser le butin `id` (le serveur valide et tranche).
+export function sendGrab(id: string): void {
+  room?.send("grab", { id });
+}
+
+// Enregistre l'application de l'effet quand le serveur confirme un ramassage.
+export function onGrabbed(cb: (d: any) => void): void {
+  grabbedCb = cb;
 }
 
 // Signale au serveur qu'une balle/objet a touché l'ennemi `id`.
