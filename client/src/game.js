@@ -59,7 +59,23 @@ scene.fog = new THREE.Fog(0x0a0a16, 55, 120);
 // Caméra PERSPECTIVE (vraie profondeur / fuyantes) vue de haut.
 let camera = new THREE.PerspectiveCamera(45, W / H, 0.1, 2000);
 const CAM_OFF = new THREE.Vector3(26, 34, 26);
-function applyCamAspect() { camera.aspect = W / H; camera.updateProjectionMatrix(); }
+
+// --- Zoom adaptatif à N'IMPORTE QUEL ratio d'écran -------------------------
+// Three.js garde le FOV *vertical* constant : le zoom perçu suit alors la
+// hauteur de l'écran -> large&court = trop dézoomé, haut&étroit (portrait) =
+// trop zoomé. On garde plutôt le FOV *diagonal* constant : la quantité de
+// monde à l'écran reste stable quel que soit le ratio (un écran large zoome un
+// peu, un écran haut dézoome, les deux se compensent au lieu de diverger).
+const REF_FOV = 45;            // FOV vertical de référence...
+const REF_ASPECT = 16 / 9;     // ...au ratio de référence
+const TAN_DIAG = Math.tan(THREE.MathUtils.degToRad(REF_FOV) / 2) * Math.hypot(1, REF_ASPECT);
+function applyCamAspect() {
+  const a = W / H;
+  camera.aspect = a;
+  // FOV vertical tel que la demi-diagonale du frustum reste constante
+  camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan(TAN_DIAG / Math.hypot(1, a)));
+  camera.updateProjectionMatrix();
+}
 applyCamAspect();
 
 // lumières
@@ -87,20 +103,185 @@ window.addEventListener("resize", () => {
 });
 
 // ============================================================
-//  MONDE INFINI : sol qui suit le joueur + génération par chunks
+//  RELIEF EN PALIERS : hauteur DÉTERMINISTE (identique sur tous les clients)
+//  -> inutile d'envoyer Y sur le réseau, chaque client le recalcule en local.
+//  Le sol est quantifié en PALIERS plats. Deux cellules voisines :
+//   • même palier / 1 marche (Δ=1)  -> franchissable (petite marche)
+//   • falaise (Δ>=2)                -> INFRANCHISSABLE, sauf escalier/rampe (connecteur)
+//  Des ponts relient certaines terres au-dessus de l'eau.
 // ============================================================
-// sol infini : un grand plan recentré sur le joueur à chaque frame
-const ground = new THREE.Mesh(new THREE.PlaneGeometry(700, 700),
-  new THREE.MeshStandardMaterial({ color: 0x5a8c46, roughness: 0.95 }));
-ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; scene.add(ground);
+const CHUNK = 40, VIEW = 4;            // taille d'un chunk, rayon de chunks chargés
+const CELLS = 12;                      // cellules de terrain par chunk
+const CELL  = CHUNK / CELLS;           // taille d'une cellule (~3.33 u)
+const STEP  = 3.0;                     // hauteur d'un palier
+const WATER_LEVEL = -1.4;              // sous ce niveau : eau (mares dans les creux)
+
+function _hh(ix, iz) {                  // hash entier -> [0,1)
+  let s = ((ix | 0) * 374761393 + (iz | 0) * 668265263) >>> 0;
+  s = ((s ^ (s >>> 13)) * 1274126177) >>> 0;
+  return ((s ^ (s >>> 16)) >>> 0) / 4294967296;
+}
+function _vnoise(x, z) {                // bruit de valeur lissé (smoothstep)
+  const x0 = Math.floor(x), z0 = Math.floor(z), fx = x - x0, fz = z - z0;
+  const u = fx * fx * (3 - 2 * fx), v = fz * fz * (3 - 2 * fz);
+  const a = _hh(x0, z0), b = _hh(x0 + 1, z0), c = _hh(x0, z0 + 1), d = _hh(x0 + 1, z0 + 1);
+  return a * (1 - u) * (1 - v) + b * u * (1 - v) + c * (1 - u) * v + d * u * v;
+}
+// signal continu sous-jacent (normalisé ~[-1,1], moyenne ~0) — AVANT quantification
+function baseHeight(x, z) {
+  const h = _vnoise(x * 0.017 + 41.7, z * 0.017 + 12.3) * 1.00     // grandes formes
+          + _vnoise(x * 0.045 + 91.1, z * 0.045 + 63.9) * 0.45     // reliefs moyens
+          + _vnoise(x * 0.110 + 7.5,  z * 0.110 + 88.2) * 0.16;    // détail
+  return (h / 1.61) * 2 - 1;            // -> ~[-1,1] centré sur 0
+}
+// Quantification en paliers avec une large BANDE MORTE centrale = vaste PLAINE (niveau 0)
+// connectée où l'on court librement ; au-delà, des MESAS (+) et des CUVETTES/lacs (-)
+// à flancs de falaise. => grand terrain jouable + reliefs francs qu'on ne gravit PAS.
+const PLAIN = 0.36;                     // demi-largeur de la plaine (part du signal en niveau 0)
+const RELIEF = 5;                       // nb max de paliers de chaque côté de la plaine
+function levelFromBase(h) {
+  const t = Math.abs(h) - PLAIN;
+  if (t <= 0) return 0;
+  const l = 1 + Math.floor(t / ((1 - PLAIN) / RELIEF));
+  return h > 0 ? l : -l;
+}
+const cellOf = v => Math.floor(v / CELL);
+// palier (entier) d'une cellule : niveau du signal au centre de la cellule
+function cellLevel(ci, cj) { return levelFromBase(baseHeight((ci + 0.5) * CELL, (cj + 0.5) * CELL)); }
+// pont : une cellule d'eau reliée par deux terres opposées de même palier -> tablier praticable
+function bridgeLevel(ci, cj) {
+  if (cellLevel(ci, cj) * STEP >= WATER_LEVEL) return null;        // pas de l'eau
+  const w = cellLevel(ci - 1, cj), e = cellLevel(ci + 1, cj);
+  if (w === e && w * STEP >= WATER_LEVEL && _hh(ci + 555, cj + 111) < 0.6) return w;
+  const n = cellLevel(ci, cj - 1), s = cellLevel(ci, cj + 1);
+  if (n === s && n * STEP >= WATER_LEVEL && _hh(ci + 111, cj + 555) < 0.6) return n;
+  return null;
+}
+// palier EFFECTIF (tient compte des ponts) -> c'est la surface où l'on marche
+function effLevel(ci, cj) { const b = bridgeLevel(ci, cj); return b !== null ? b : cellLevel(ci, cj); }
+// connecteur (escalier/rampe) : SEUL moyen de franchir une falaise, placé de façon
+// déterministe sur ~1 bord de falaise sur 3. Ailleurs, la falaise est infranchissable.
+function hasConnector(hci, hcj, lci, lcj) { return _hh(hci * 131 + lci, hcj * 131 + lcj) < 0.33; }
+// un bord entre cellule (ci,cj) et voisine (ni,nj) est-il PRATICABLE ?
+function edgePassable(ci, cj, ni, nj) {
+  const a = effLevel(ci, cj), b = effLevel(ni, nj);
+  if (a === b) return true;                                         // même palier -> libre
+  return a > b ? hasConnector(ci, cj, ni, nj) : hasConnector(ni, nj, ci, cj);  // TOUT dénivelé = falaise
+}
+// niveau EFFECTIF au point monde (x,z)
+function levelAt(x, z) { return effLevel(cellOf(x), cellOf(z)); }
+// hauteur du SOL (surface plate du palier) au point (x,z) — utilisée PARTOUT
+function terrainHeight(x, z) { return levelAt(x, z) * STEP; }
+// déplacement avec COLLISION de falaise : glisse le long des murs infranchissables,
+// axe par axe (joueur ET ennemis passent par ici). Renvoie la position corrigée.
+const _mv = { x: 0, z: 0 };
+function moveWithCliffs(x, z, nx, nz) {
+  const ci = cellOf(x), cj = cellOf(z);
+  let rx = nx;
+  const nci = cellOf(nx);
+  if (nci !== ci && !edgePassable(ci, cj, nci, cj)) rx = x;       // mur en X -> bloqué sur X
+  const rci = cellOf(rx), ncj = cellOf(nz);
+  let rz = nz;
+  if (ncj !== cj && !edgePassable(rci, cj, rci, ncj)) rz = z;     // mur en Z -> bloqué sur Z
+  _mv.x = rx; _mv.z = rz; return _mv;
+}
+
+// couleur d'une surface de palier selon sa hauteur (sable -> herbe -> terre haute -> pierre)
+const _tc = new THREE.Color();
+function terraceColor(h, jitter) {
+  const col = h < WATER_LEVEL + 0.3 ? 0xcbb784
+            : h < STEP * 0.5        ? 0x5f9048
+            : h < STEP * 1.5        ? 0x4c8038
+            : h < STEP * 2.5        ? 0x7d8a5a
+            :                         0x9aa0ac;
+  _tc.setHex(col);
+  _tc.offsetHSL(0, 0, (jitter - 0.5) * 0.10);
+  return _tc;
+}
+const COL_CLIFF = new THREE.Color(0x6f6353);      // paroi de falaise (terre/roche)
+const COL_STEP  = new THREE.Color(0x8a7d63);      // flanc d'une simple marche
+const COL_RAMP  = new THREE.Color(0xb79b6a);      // escalier / rampe (pierre claire)
+const COL_BRIDGE = new THREE.Color(0x7a5a38);     // planches de pont
+
+// ============================================================
+//  MONDE INFINI : terrain + props générés par chunks autour du joueur
+// ============================================================
+// eau : grand plan translucide recentré sur le joueur ; les creux du terrain y baignent
+const water = new THREE.Mesh(new THREE.PlaneGeometry(700, 700),
+  new THREE.MeshStandardMaterial({ color: 0x2f7fd0, transparent: true, opacity: 0.6, roughness: 0.2, metalness: 0.25 }));
+water.rotation.x = -Math.PI / 2; water.position.y = WATER_LEVEL; scene.add(water);
+
+// terrain : une tuile en PALIERS par chunk (tops plats + parois de falaise + escaliers/ponts)
+// DoubleSide : évite tout souci d'orientation de face sur les parois et les marches.
+const terrainMat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 1.0, side: THREE.DoubleSide });
+const terrainMeshes = [];                         // tuiles visibles -> raycast visée/déplacement
+const _P = [], _C = [];                            // buffers réutilisés (positions / couleurs)
+function _tri(ax, ay, az, bx, by, bz, cx, cy, cz, col) {
+  _P.push(ax, ay, az, bx, by, bz, cx, cy, cz);
+  for (let k = 0; k < 3; k++) _C.push(col.r, col.g, col.b);
+}
+function _quad(p1, p2, p3, p4, col) {              // p = [x,y,z] ; 2 triangles
+  _tri(p1[0], p1[1], p1[2], p2[0], p2[1], p2[2], p3[0], p3[1], p3[2], col);
+  _tri(p1[0], p1[1], p1[2], p3[0], p3[1], p3[2], p4[0], p4[1], p4[2], col);
+}
+// ESCALIER visible : marches qui descendent du haut (H) au bas (Hn) en s'avançant
+// dans la cellule basse. (ex0,ez0)-(ex1,ez1) = arête partagée ; (sx,sz) = sens de descente.
+function _stairs(ex0, ez0, ex1, ez1, sx, sz, H, Hn, col) {
+  const n = Math.max(1, Math.round((H - Hn) / 1.1));   // ~1 marche par 1.1 u de dénivelé
+  const run = CELL * 0.94;
+  for (let s = 0; s < n; s++) {
+    const yTop = H - (H - Hn) * (s / n), yBot = H - (H - Hn) * ((s + 1) / n);
+    const d0 = (s / n) * run, d1 = ((s + 1) / n) * run;
+    const gTop0 = [ex0 + sx * d0, yTop, ez0 + sz * d0], gTop1 = [ex1 + sx * d0, yTop, ez1 + sz * d0];
+    const gEnd0 = [ex0 + sx * d1, yTop, ez0 + sz * d1], gEnd1 = [ex1 + sx * d1, yTop, ez1 + sz * d1];
+    _quad(gTop0, gTop1, gEnd1, gEnd0, col);            // giron (dessus de la marche)
+    const rBot0 = [ex0 + sx * d0, yBot, ez0 + sz * d0], rBot1 = [ex1 + sx * d0, yBot, ez1 + sz * d0];
+    _quad(rBot0, rBot1, gTop1, gTop0, col);            // contremarche (face verticale)
+  }
+}
+function buildTerrainTile(cx, cz) {
+  _P.length = 0; _C.length = 0;
+  const ci0 = cx * CELLS, cj0 = cz * CELLS;
+  for (let a = 0; a < CELLS; a++) for (let b = 0; b < CELLS; b++) {
+    const ci = ci0 + a, cj = cj0 + b;
+    const L = effLevel(ci, cj), H = L * STEP;
+    const x0 = ci * CELL, x1 = x0 + CELL, z0 = cj * CELL, z1 = z0 + CELL;
+    const jit = _hh(ci * 7, cj * 7);
+    // dessus plat du palier (ou tablier de pont)
+    const isBridge = bridgeLevel(ci, cj) !== null;
+    const topCol = isBridge ? COL_BRIDGE : terraceColor(H, jit);
+    _quad([x0, H, z0], [x0, H, z1], [x1, H, z1], [x1, H, z0], topCol);
+    // vers chaque voisin PLUS BAS (construit une seule fois, par la cellule HAUTE) :
+    //  - avec connecteur -> ESCALIER praticable ; sinon -> paroi de FALAISE infranchissable
+    const nb = [[ci - 1, cj, x0, z0, x0, z1], [ci + 1, cj, x1, z1, x1, z0],
+                [ci, cj - 1, x1, z0, x0, z0], [ci, cj + 1, x0, z1, x1, z1]];
+    for (const [ni, nj, ex0, ez0, ex1, ez1] of nb) {
+      const Ln = effLevel(ni, nj), Hn = Ln * STEP;
+      if (Ln >= L) continue;                         // seul le côté HAUT construit la paroi
+      if (hasConnector(ci, cj, ni, nj)) {            // ACCÈS -> escalier visible
+        _stairs(ex0, ez0, ex1, ez1, Math.sign(ni - ci), Math.sign(nj - cj), H, Hn, COL_RAMP);
+      } else {                                        // pas d'accès -> falaise verticale pleine
+        _quad([ex0, Hn, ez0], [ex1, Hn, ez1], [ex1, H, ez1], [ex0, H, ez0], (L - Ln) >= 2 ? COL_CLIFF : COL_STEP);
+      }
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(_P), 3));
+  geo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(_C), 3));
+  geo.computeVertexNormals();
+  const m = new THREE.Mesh(geo, terrainMat);
+  m.receiveShadow = true; m.castShadow = false;
+  return m;
+}
 
 // assets de props PARTAGÉS (géométries/matériaux réutilisés -> pas de fuite mémoire)
 const trunkGeo = new THREE.CylinderGeometry(0.35, 0.4, 1.2, 5);
 const topGeo   = new THREE.ConeGeometry(1.6, 4, 6);
 const rockGeo  = new THREE.IcosahedronGeometry(1, 0);
 const trunkMat = new THREE.MeshStandardMaterial({ color: 0x6b4a2f, flatShading: true });
-const rockMat  = new THREE.MeshStandardMaterial({ color: 0x8a8f9c, flatShading: true });
-const topMats  = [0xe86fa0, 0x8fd67a, 0x7ec8e3, 0xf0c85a].map(c => new THREE.MeshStandardMaterial({ color: c, flatShading: true }));
+// roches de teintes variées (granit clair, gris bleuté, ocre, ardoise)
+const rockMats = [0x8a8f9c, 0x9aa0ac, 0xa7906f, 0x6f747f].map(c => new THREE.MeshStandardMaterial({ color: c, flatShading: true }));
+const topMats  = [0xe86fa0, 0x8fd67a, 0x7ec8e3, 0xf0c85a, 0x6db85a, 0xc8e070].map(c => new THREE.MeshStandardMaterial({ color: c, flatShading: true }));
 
 // PRNG déterministe par chunk -> un chunk se régénère IDENTIQUE si on y revient
 function chunkRand(cx, cz, i) {
@@ -108,15 +289,18 @@ function chunkRand(cx, cz, i) {
   s = ((s ^ (s >>> 13)) * 1274126177) >>> 0;
   return ((s ^ (s >>> 16)) >>> 0) / 4294967296;
 }
-const CHUNK = 40, VIEW = 3;          // taille d'un chunk, rayon de chunks chargés autour du joueur
 const loadedChunks = new Map();
 function buildChunk(cx, cz) {
   const g = new THREE.Group();
+  const tile = buildTerrainTile(cx, cz);                // sol en relief de ce chunk
+  g.add(tile); g.userData.tile = tile; terrainMeshes.push(tile);
   const n = 3 + Math.floor(chunkRand(cx, cz, 0) * 6);   // 3 à 8 props par chunk
   for (let i = 0; i < n; i++) {
     const rx = chunkRand(cx, cz, i*4+1), rz = chunkRand(cx, cz, i*4+2);
     const rt = chunkRand(cx, cz, i*4+3), rs = chunkRand(cx, cz, i*4+4);
     const x = cx * CHUNK + rx * CHUNK, z = cz * CHUNK + rz * CHUNK;
+    const gy = terrainHeight(x, z);                     // altitude du sol sous le prop
+    if (gy < WATER_LEVEL) continue;                      // pas de prop dans l'eau
     let m;
     if (rt < 0.55) { // arbre
       const grp = new THREE.Group();
@@ -124,9 +308,10 @@ function buildChunk(cx, cz) {
       const top = new THREE.Mesh(topGeo, topMats[Math.floor(rs * topMats.length) % topMats.length]);
       top.position.y = 3; top.castShadow = true; top.scale.setScalar(0.8 + rs * 0.6);
       grp.add(trunk, top); m = grp;
+      m.position.y = gy;
     } else { // rocher
-      m = new THREE.Mesh(rockGeo, rockMat); const s = 1 + rs * 1.2;
-      m.scale.setScalar(s); m.position.y = 0.55 * s; m.castShadow = true;
+      m = new THREE.Mesh(rockGeo, rockMats[Math.floor(rt * rockMats.length) % rockMats.length]); const s = 1 + rs * 1.2;
+      m.scale.setScalar(s); m.position.y = gy + 0.55 * s; m.castShadow = true;
       m.rotation.set(rx * 6, rz * 6, rt * 6);
     }
     m.position.x = x; m.position.z = z; g.add(m);
@@ -144,7 +329,12 @@ function updateChunks(px, pz) {
     const k = (fx + dx) + "," + (fz + dz); need.add(k);
     if (!loadedChunks.has(k)) buildChunk(fx + dx, fz + dz);
   }
-  for (const [k, g] of loadedChunks) if (!need.has(k)) { scene.remove(g); loadedChunks.delete(k); } // décharge derrière
+  for (const [k, g] of loadedChunks) if (!need.has(k)) {                // décharge derrière
+    scene.remove(g);
+    const ti = terrainMeshes.indexOf(g.userData.tile); if (ti >= 0) terrainMeshes.splice(ti, 1);
+    g.userData.tile.geometry.dispose();
+    loadedChunks.delete(k);
+  }
 }
 updateChunks(0, 0);
 
@@ -198,16 +388,17 @@ function updateAimPreview() {
   const key = player.inv[armed]; if (!key) return;
   camera.updateMatrixWorld();
   raycaster.setFromCamera(mouseNDC, camera);
-  if (!raycaster.ray.intersectPlane(groundPlane, aimPoint)) return;
+  if (!raycastGround(aimPoint)) return;
   if (key === "bombe") {
-    bombPrev.visible = true; bombPrev.position.set(aimPoint.x, 0.06, aimPoint.z);
+    bombPrev.visible = true; bombPrev.position.set(aimPoint.x, terrainHeight(aimPoint.x, aimPoint.z) + 0.06, aimPoint.z);
   } else if (key === "laser") {
     const a = Math.atan2(aimPoint.z - player.z, aimPoint.x - player.x);
+    const lx = player.x + Math.cos(a) * 50, lz = player.z + Math.sin(a) * 50;
     laserPrev.visible = true;
-    laserPrev.position.set(player.x + Math.cos(a) * 50, 0.9, player.z + Math.sin(a) * 50);
+    laserPrev.position.set(lx, terrainHeight(lx, lz) + 0.9, lz);
     laserPrev.rotation.y = -a;
   } else if (key === "grenade") {
-    grenadePrev.visible = true; grenadePrev.position.set(aimPoint.x, 0.06, aimPoint.z);
+    grenadePrev.visible = true; grenadePrev.position.set(aimPoint.x, terrainHeight(aimPoint.x, aimPoint.z) + 0.06, aimPoint.z);
   }
 }
 
@@ -447,10 +638,18 @@ let mouseNDC = new THREE.Vector2(0, 0);
 const raycaster = new THREE.Raycaster();
 const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 let dragging = false, aiming = false;
+const _rayHits = [];
+// point du sol (relief) sous le rayon courant : raycast des tuiles, repli sur le plan y=0
+function raycastGround(out) {
+  _rayHits.length = 0;
+  raycaster.intersectObjects(terrainMeshes, false, _rayHits);
+  if (_rayHits.length) { out.copy(_rayHits[0].point); return out; }
+  return raycaster.ray.intersectPlane(groundPlane, out);
+}
 function pointerToGround(e, out) {   // met à jour la visée + renvoie le point au sol sous le doigt/souris
   mouseNDC.x = (e.clientX / W) * 2 - 1; mouseNDC.y = -(e.clientY / H) * 2 + 1;
   raycaster.setFromCamera(mouseNDC, camera);
-  return raycaster.ray.intersectPlane(groundPlane, out);
+  return raycastGround(out);
 }
 // pointerdown : objet armé -> on VISE (preview qui suit le doigt) ; sinon -> déplacement (drag)
 renderer.domElement.addEventListener("pointerdown", e => {
@@ -520,7 +719,7 @@ function explode(x, z, radius, dmg) {
   for (const e of enemies) if (dist2(x, z, e.x, e.z) < (radius + e.r) ** 2) { damageEnemy(e, dmg); e.flash = 0.1; }
   spawnParticles(x, z, 0xff9a4a, 22);
   const ring = new THREE.Mesh(new THREE.TorusGeometry(1, 0.4, 6, 24), new THREE.MeshBasicMaterial({ color: 0xff9a4a }));
-  ring.rotation.x = -Math.PI / 2; ring.position.set(x, 0.5, z); scene.add(ring);
+  ring.rotation.x = -Math.PI / 2; ring.position.set(x, terrainHeight(x, z) + 0.5, z); scene.add(ring);
   effects.push({ type:"boom", life:0.4, max:0.4, radius, mesh:ring });
   beep(90, 0.3, "sawtooth", 0.06);
 }
@@ -621,11 +820,12 @@ const invFull = () => player.inv.indexOf(null) === -1;
 // ============================================================
 function spawnParticles(x, z, col, n) {
   const mat = new THREE.MeshBasicMaterial({ color: col });
+  const gy = terrainHeight(x, z);                    // éclosion au niveau du sol local
   for (let i = 0; i < n; i++) {
     const a = rand(0, 6.28), s = rand(4, 16);
     const m = new THREE.Mesh(GEO.particle, mat);
-    m.position.set(x, 1, z); scene.add(m);
-    particles.push({ x, z, y:1, vx:Math.cos(a)*s, vz:Math.sin(a)*s, vy:rand(4,10), life:rand(0.3,0.6), mesh:m });
+    m.position.set(x, gy + 1, z); scene.add(m);
+    particles.push({ x, z, y: gy + 1, floor: gy, vx:Math.cos(a)*s, vz:Math.sin(a)*s, vy:rand(4,10), life:rand(0.3,0.6), mesh:m });
   }
 }
 
@@ -644,12 +844,13 @@ function loop(now) {
   netSync(now);
   // caméra suit le joueur (+ petit shake)
   const px = player ? player.x : 0, pz = player ? player.z : 0;
-  ground.position.set(px, 0, pz);   // sol infini qui suit le joueur
+  const ph = player && player.gy != null ? player.gy : terrainHeight(px, pz);   // altitude lissée
+  water.position.set(px, WATER_LEVEL, pz);   // nappe d'eau qui suit le joueur
   updateChunks(px, pz);             // génère/décharge le monde autour de lui
   const sx = shake > 0 ? rand(-shake, shake) : 0, sz = shake > 0 ? rand(-shake, shake) : 0;
-  camera.position.set(px + CAM_OFF.x + sx, CAM_OFF.y, pz + CAM_OFF.z + sz);
-  camera.lookAt(px, 0, pz);
-  sun.position.set(px + 40, 80, pz + 20); sun.target.position.set(px, 0, pz);
+  camera.position.set(px + CAM_OFF.x + sx, CAM_OFF.y + ph, pz + CAM_OFF.z + sz);
+  camera.lookAt(px, ph, pz);
+  sun.position.set(px + 40, 80 + ph, pz + 20); sun.target.position.set(px, ph, pz);
   updateAimPreview();   // feedforward : prévisualise l'objet armé au sol
   if (shake > 0) shake -= dt * 2;
   composer.render();
@@ -755,7 +956,7 @@ function spawnRemoteShot(d) {
     }
   } else if (d.k === "bombe") {
     const ring = new THREE.Mesh(new THREE.TorusGeometry(1, 0.4, 6, 24), new THREE.MeshBasicMaterial({ color: 0xff9a4a }));
-    ring.rotation.x = -Math.PI / 2; ring.position.set(d.x, 0.5, d.z); scene.add(ring);
+    ring.rotation.x = -Math.PI / 2; ring.position.set(d.x, terrainHeight(d.x, d.z) + 0.5, d.z); scene.add(ring);
     remoteShots.push({ type:"boom", x:d.x, z:d.z, life:0.4, max:0.4, radius:11, mesh:ring });
     spawnParticles(d.x, d.z, 0xff9a4a, 22);
   } else if (d.k === "laser") {
@@ -776,14 +977,15 @@ function updateRemoteShots(dt) {
     s.life -= dt;
     if (s.type === "bullet" || s.type === "boomerang") {
       s.x += s.vx * dt; s.z += s.vz * dt;
-      s.mesh.position.set(s.x, BULLET_Y, s.z);
+      s.mesh.position.set(s.x, terrainHeight(s.x, s.z) + BULLET_Y, s.z);
       if (s.type === "boomerang") s.mesh.rotation.y += 0.7;
     } else if (s.type === "boom") {
       const k = 1 - s.life / s.max;
       s.mesh.scale.setScalar(0.5 + s.radius * k);
       s.mesh.material.transparent = true; s.mesh.material.opacity = Math.max(0, s.life / s.max);
     } else if (s.type === "laser") {
-      s.mesh.position.set(s.x + Math.cos(s.ang) * s.len / 2, 1.1, s.z + Math.sin(s.ang) * s.len / 2);
+      { const lx = s.x + Math.cos(s.ang) * s.len / 2, lz = s.z + Math.sin(s.ang) * s.len / 2;
+        s.mesh.position.set(lx, terrainHeight(s.x, s.z) + 1.1, lz); }
       s.mesh.rotation.y = -s.ang;
       const t = s.life / s.max; s.mesh.scale.set(1, 0.4 + t, 0.4 + t);
     }
@@ -947,6 +1149,7 @@ function netSync(now) {
     const s = sampleSnapshots(buf, now - REMOTE_INTERP_DELAY);
     if (s) {
       g.position.x = s.x;
+      g.position.y = terrainHeight(s.x, s.z);   // posé sur le relief (recalculé en local)
       g.position.z = s.z;
       g.rotation.y = s.face + FACE_OFFSET;   // orientation du CORPS via `face`
     }
@@ -1013,7 +1216,11 @@ function update(dt) {
   const ml = Math.hypot(mx, mz);
   player.moving = ml > 0.001;
   if (ml > 0) { mx /= ml; mz /= ml; player.face = Math.atan2(mx, mz); }
-  player.x += mx * player.speed * dt; player.z += mz * player.speed * dt;
+  { const nx = player.x + mx * player.speed * dt, nz = player.z + mz * player.speed * dt;
+    const mv = moveWithCliffs(player.x, player.z, nx, nz); player.x = mv.x; player.z = mv.z; }
+  // hauteur lissée (monte/descend les marches en douceur -> pas de saut sec)
+  { const th = terrainHeight(player.x, player.z);
+    player.gy = player.gy == null ? th : player.gy + (th - player.gy) * Math.min(1, dt * 9); }
 
   // spawn : ennemis normaux jusqu'au boss ; passé le timer, plus de spawn -> boss quand tout est nettoyé
   // en co-op : la horde (et le boss) sont pilotés par le serveur -> on désactive le spawn local
@@ -1101,7 +1308,10 @@ function update(dt) {
     const e = enemies[i];
     const a = Math.atan2(player.z - e.z, player.x - e.x);
     // en co-op, la position vient du serveur (voir netSync) -> pas de déplacement local
-    if (!e.net) { e.x += Math.cos(a) * e.speed * dt + e.kx; e.z += Math.sin(a) * e.speed * dt + e.kz; e.kx *= 0.86; e.kz *= 0.86; }
+    if (!e.net) {
+      const nx = e.x + Math.cos(a) * e.speed * dt + e.kx, nz = e.z + Math.sin(a) * e.speed * dt + e.kz;
+      const mv = moveWithCliffs(e.x, e.z, nx, nz); e.x = mv.x; e.z = mv.z; e.kx *= 0.86; e.kz *= 0.86;
+    }
     if (e.flash > 0) e.flash -= dt;
     const rr = e.r + player.r;
     if (dist2(e.x, e.z, player.x, player.z) < rr * rr && player.iframe <= 0) {
@@ -1141,7 +1351,7 @@ function update(dt) {
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
     p.x += p.vx * dt; p.z += p.vz * dt; p.y += p.vy * dt; p.vy -= 30 * dt; p.vx *= 0.92; p.vz *= 0.92; p.life -= dt;
-    if (p.life <= 0 || p.y < 0) { scene.remove(p.mesh); particles.splice(i, 1); }
+    if (p.life <= 0 || p.y < (p.floor ?? 0)) { scene.remove(p.mesh); particles.splice(i, 1); }
   }
 
   // BOSS : barrage de projectiles vers le joueur
@@ -1179,44 +1389,49 @@ function update(dt) {
 // ============================================================
 function syncMeshes() {
   if (!player) return;
-  playerMesh.position.set(player.x, 0, player.z);
+  const ph = player.gy != null ? player.gy : terrainHeight(player.x, player.z);   // altitude lissée
+  playerMesh.position.set(player.x, ph, player.z);
   playerMesh.rotation.y = player.face + FACE_OFFSET;
   playerMesh.visible = !(player.iframe > 0 && Math.floor(gameTime * 20) % 2);
   // bouclier : bulle translucide autour du perso quand actif
   shieldMesh.visible = (state === "play") && player.shield > 0;
   if (shieldMesh.visible) {
-    shieldMesh.position.set(player.x, 1.2, player.z);
+    shieldMesh.position.set(player.x, ph + 1.2, player.z);
     shieldMesh.scale.setScalar(1 + Math.sin(gameTime * 8) * 0.06);
   }
   // compagnon volant : au-dessus de la tête, bob + anneau tournant + visée
   if (petMesh) {
-    petMesh.position.set(player.x, 4.0 + Math.sin(gameTime * 2.5) * 0.25, player.z);
+    petMesh.position.set(player.x, ph + 4.0 + Math.sin(gameTime * 2.5) * 0.25, player.z);
     petMesh.userData.ring.rotation.z += 0.05;
     if (player.hasAim) petMesh.rotation.y = Math.PI / 2 - player.aim;
   }
   for (const e of enemies) {
-    e.mesh.position.set(e.x, e.r, e.z); e.mesh.rotation.y += e.spin * 0.02;
+    const th = terrainHeight(e.x, e.z);                 // hauteur lissée : monte/descend les marches
+    e._gy = e._gy == null ? th : e._gy + (th - e._gy) * 0.25;
+    const eh = e._gy;
+    e.mesh.position.set(e.x, eh + e.r, e.z); e.mesh.rotation.y += e.spin * 0.02;
     e.mesh.material = e.flash > 0 ? whiteMat : (e.mat || MAT[matKey(e)]);
     // barre de vie : visible dès qu'on l'a touché, billboard face caméra
     const ratio = clamp(e.hp / e.maxHp, 0, 1);
     e.bar.visible = e.hp < e.maxHp;
     if (e.bar.visible) {
-      e.bar.position.set(e.x, e.r * 2 + 1.2, e.z);
+      e.bar.position.set(e.x, eh + e.r * 2 + 1.2, e.z);
       e.bar.quaternion.copy(camera.quaternion);
       const f = e.bar.userData.fill, w = e.bar.userData.w;
       f.scale.x = ratio; f.position.x = -w * (1 - ratio) / 2;
       f.material.color.setHSL(0.33 * ratio, 0.85, 0.5);
     }
   }
-  for (const b of bullets) b.mesh.position.set(b.x, BULLET_Y, b.z);
-  for (const b of enemyBullets) b.mesh.position.set(b.x, BULLET_Y, b.z);
-  for (const p of pickups) { p.mesh.position.set(p.x, 1.2 + Math.sin(gameTime * 3 + p.bob) * 0.25, p.z); p.mesh.rotation.y += 0.03; }
+  for (const b of bullets) b.mesh.position.set(b.x, terrainHeight(b.x, b.z) + BULLET_Y, b.z);
+  for (const b of enemyBullets) b.mesh.position.set(b.x, terrainHeight(b.x, b.z) + BULLET_Y, b.z);
+  for (const p of pickups) { p.mesh.position.set(p.x, terrainHeight(p.x, p.z) + 1.2 + Math.sin(gameTime * 3 + p.bob) * 0.25, p.z); p.mesh.rotation.y += 0.03; }
   for (const p of particles) p.mesh.position.set(p.x, p.y, p.z);
   for (const f of effects) {
-    if (f.type === "boomerang") { f.mesh.position.set(f.x, BULLET_Y, f.z); f.mesh.rotation.y += 0.7; }
+    if (f.type === "boomerang") { f.mesh.position.set(f.x, terrainHeight(f.x, f.z) + BULLET_Y, f.z); f.mesh.rotation.y += 0.7; }
     else if (f.type === "boom") { const k = 1 - f.life / f.max; f.mesh.scale.setScalar(0.5 + f.radius * k); f.mesh.material.opacity = f.life / f.max; f.mesh.material.transparent = true; }
     else if (f.type === "laser") {
-      f.mesh.position.set(player.x + Math.cos(f.ang) * f.len / 2, 1.1, player.z + Math.sin(f.ang) * f.len / 2);
+      const lx = player.x + Math.cos(f.ang) * f.len / 2, lz = player.z + Math.sin(f.ang) * f.len / 2;
+      f.mesh.position.set(lx, ph + 1.1, lz);
       f.mesh.rotation.y = -f.ang;
       const s = f.life / f.max; f.mesh.scale.set(1, 0.4 + s, 0.4 + s);
     }
@@ -1318,9 +1533,13 @@ densSlider.addEventListener("input", () => {
   const v = +densSlider.value;
   $("densVal").textContent = v === 0 ? "Aucun" : "✕" + v.toFixed(1);
 });
-if (!IS_LOCAL) {   // en prod : on retire juste l'indice de la touche B (debug local)
+if (!IS_LOCAL) {   // en prod : on retire l'indice de la touche B (debug local)
   const keysEl = document.querySelector("#menuScreen .keys");
   if (keysEl) keysEl.innerHTML = keysEl.innerHTML.replace(" · B : boss immédiat", "");
+  // ...et on masque les réglages avancés (boss/densité) : sur le serveur on crée
+  // juste une partie aux valeurs par défaut. Réglables uniquement en local.
+  $("bossSetting")?.classList.add("hidden");
+  $("densSetting")?.classList.add("hidden");
 }
 // détection tactile -> instructions adaptées au mobile
 const IS_TOUCH = ("ontouchstart" in window) || navigator.maxTouchPoints > 0;

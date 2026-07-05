@@ -1,5 +1,6 @@
 import { Room, Client } from "colyseus";
 import { ArenaState, Player, Enemy, Pickup } from "../schema/ArenaState";
+import { moveWithCliffs } from "../terrain";
 
 // Pools de butin — DOIVENT rester alignés avec les définitions client (game.js).
 const WEAPON_KEYS = ["pistolet", "mitraillette", "pompe", "canon", "triple", "flamme"];
@@ -38,6 +39,7 @@ export class ArenaRoom extends Room<ArenaState> {
 
   private spawnAcc = 0;
   private seq = 0;
+  private _mv = { x: 0, z: 0 }; // scratch réutilisé pour la collision de falaise
   private meta = new Map<string, { speed: number; sc: number }>();
   private hostId: string | null = null; // 1er joueur = définit/modifie les params
   private density = 1; // 0..2
@@ -75,10 +77,15 @@ export class ArenaRoom extends Room<ArenaState> {
     });
 
     this.onMessage("hit", (_client, d: { id: string; dmg: number }) => {
-      const e = this.state.enemies.get(d.id);
+      const e = this.state.enemies.get(d?.id);
       if (!e) return;
-      e.hp -= d.dmg;
-      if (e.hp <= 0) this.killEnemy(d.id);
+      // On ne fait JAMAIS confiance au dmg du client : un NaN/undefined/négatif
+      // rendrait e.hp = NaN de façon irréversible (NaN <= 0 est false pour
+      // toujours) -> ennemi immortel qui fige la partie. On borne donc l'entrée
+      // et, par sécurité, on tue tout ennemi dont le hp deviendrait non-fini.
+      const dmg = clampNum(d?.dmg, 0, 1e7, 0);
+      e.hp -= dmg;
+      if (!isFinite(e.hp) || e.hp <= 0) this.killEnemy(d.id);
     });
 
     // Ramassage d'un butin : le serveur valide la proximité, retire le pickup pour
@@ -149,8 +156,10 @@ export class ArenaRoom extends Room<ArenaState> {
       const dx = tx - e.x, dz = tz - e.z;
       const len = Math.hypot(dx, dz) || 1;
       const sp = this.meta.get(id)?.speed ?? 5;
-      e.x += (dx / len) * sp * dt;
-      e.z += (dz / len) * sp * dt;
+      // collision de falaise : l'ennemi glisse le long des murs (mêmes règles que le client)
+      const nx = e.x + (dx / len) * sp * dt, nz = e.z + (dz / len) * sp * dt;
+      moveWithCliffs(e.x, e.z, nx, nz, this._mv);
+      e.x = this._mv.x; e.z = this._mv.z;
     });
   }
 
