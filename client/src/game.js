@@ -639,8 +639,45 @@ requestAnimationFrame(loop);
 // ============================================================
 const remoteAvatars = new Map();   // sessionId -> THREE.Group
 let netSendT = 0;
-const NET_HZ = 15;                  // fréquence d'envoi de la position
+const NET_HZ = 20;                  // fréquence d'envoi de la position (= tick serveur)
+// Interpolation par snapshots : on rend les joueurs distants avec ce léger retard
+// fixe et on interpole entre les 2 positions reçues qui encadrent l'instant de rendu.
+// Résultat fluide quel que soit le débit réseau (~2 intervalles d'envoi de marge).
+const REMOTE_INTERP_DELAY = 100;   // ms
 let wantDensity = 1, sentDensity = -1;   // densité de horde voulue (outil de test)
+
+// lerp d'angle par le plus court chemin (gère le passage -π / +π)
+function lerpAngle(a, b, t) {
+  let d = b - a;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return a + d * t;
+}
+
+// échantillonne le buffer de snapshots {t,x,z,face} à l'instant renderT.
+// Renvoie la position/angle interpolés + un flag `moving` (pour l'anim course/idle).
+// Pas d'extrapolation : si renderT dépasse le dernier snapshot (paquet en retard),
+// on fige sur le dernier connu plutôt que de sur-anticiper.
+function sampleSnapshots(buf, renderT) {
+  const n = buf.length;
+  if (n === 0) return null;
+  if (n === 1 || renderT <= buf[0].t) return { x: buf[0].x, z: buf[0].z, face: buf[0].face, moving: false };
+  const last = buf[n - 1];
+  if (renderT >= last.t) return { x: last.x, z: last.z, face: last.face, moving: false };
+  for (let i = 0; i < n - 1; i++) {
+    const s0 = buf[i], s1 = buf[i + 1];
+    if (renderT >= s0.t && renderT <= s1.t) {
+      const u = (renderT - s0.t) / ((s1.t - s0.t) || 1);
+      return {
+        x: s0.x + (s1.x - s0.x) * u,
+        z: s0.z + (s1.z - s0.z) * u,
+        face: lerpAngle(s0.face, s1.face, u),
+        moving: Math.hypot(s1.x - s0.x, s1.z - s0.z) > 0.05,
+      };
+    }
+  }
+  return { x: last.x, z: last.z, face: last.face, moving: false };
+}
 
 // fallback low-poly : le temps que Barbarian.glb charge (ou s'il échoue)
 function makeRemotePrimitive() {
@@ -846,20 +883,36 @@ function netSync(now) {
     if (!av) { av = makeRemoteAvatar(p.x, p.z); remoteAvatars.set(id, av); }
     // upgrade primitive -> vrai modèle dès que Barbarian.glb est chargé
     else if (!av.isModel && charProto) {
+      const oldBuf = av.buf;
       scene.remove(av.group);
       av = makeRemoteAvatar(av.group.position.x, av.group.position.z);
+      av.buf = oldBuf;   // on garde l'historique d'interpolation (pas de saut)
       remoteAvatars.set(id, av);
     }
     const g = av.group;
-    g.position.x += (p.x - g.position.x) * 0.25;
-    g.position.z += (p.z - g.position.z) * 0.25;
-    // orientation du CORPS via `face` (identique au joueur local)
-    g.rotation.y = (p.face || 0) + FACE_OFFSET;
+
+    // bufferiser chaque NOUVELLE position serveur avec un timestamp local
+    if (!av.buf) av.buf = [];
+    const buf = av.buf;
+    const face = p.face || 0;
+    const prev = buf[buf.length - 1];
+    if (!prev || Math.abs(p.x - prev.x) > 1e-3 || Math.abs(p.z - prev.z) > 1e-3 || Math.abs(face - prev.face) > 1e-3) {
+      buf.push({ t: now, x: p.x, z: p.z, face });
+      // purge l'historique devenu inutile (au-delà du délai d'interpolation + marge)
+      while (buf.length > 2 && buf[1].t < now - (REMOTE_INTERP_DELAY + 250)) buf.shift();
+    }
+
+    // rendu interpolé à (now - délai) entre les 2 snapshots qui l'encadrent
+    const s = sampleSnapshots(buf, now - REMOTE_INTERP_DELAY);
+    if (s) {
+      g.position.x = s.x;
+      g.position.z = s.z;
+      g.rotation.y = s.face + FACE_OFFSET;   // orientation du CORPS via `face`
+    }
     g.visible = (state === "play");
-    // blend course/idle : distant = tant que l'avatar rattrape sa position serveur
+    // blend course/idle : basé sur le mouvement réel entre les snapshots interpolés
     if (av.actRun) {
-      const gap = Math.hypot(p.x - g.position.x, p.z - g.position.z);
-      const t = gap > 0.15 ? 1 : 0;
+      const t = s && s.moving ? 1 : 0;
       av.actRun.weight += (t - av.actRun.weight) * 0.2;
       if (av.actIdle) av.actIdle.weight = 1 - av.actRun.weight;
     }
