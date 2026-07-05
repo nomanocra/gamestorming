@@ -48,6 +48,7 @@
     padding: 13px 28px; font-size: 17px; font-weight: 700; border-radius: 12px; cursor: pointer;
     box-shadow: 0 4px 0 #14141f, 0 8px 24px rgba(0,0,0,.4); pointer-events: auto; }
   .btn:active { transform: translateY(2px); }
+  .btn.ghost { background: rgba(255,255,255,.06); box-shadow: none; border-color: #45456a; font-weight: 600; }
   .tag { font-size: 12px; letter-spacing: 2px; opacity: .5; text-transform: uppercase; }
   .setting { display: flex; flex-direction: column; gap: 8px; align-items: center; }
   .setting label { font-size: 14px; opacity: .85; }
@@ -63,6 +64,16 @@
   .board .rk { opacity: .5; width: 28px; text-align: left; }
   .board .nm { flex: 1; text-align: left; padding-left: 8px; }
   .board .sc { color: #9f8; font-weight: 700; }
+  /* liste des parties en cours (lobby) */
+  #partyList { width: 380px; max-width: 90vw; max-height: 46vh; overflow-y: auto; }
+  #partyList li { display: flex; flex-direction: column; align-items: flex-start; gap: 3px;
+    padding: 11px 14px; margin-bottom: 8px; border-radius: 10px; background: rgba(255,255,255,.05);
+    border: 1px solid rgba(255,255,255,.08); cursor: pointer; transition: background .12s, border-color .12s; }
+  #partyList li:hover { background: rgba(120,160,255,.16); border-color: #6a7fff; }
+  #partyList li.full { opacity: .5; cursor: not-allowed; }
+  #partyList li.full:hover { background: rgba(255,255,255,.05); border-color: rgba(255,255,255,.08); }
+  #partyList .pn { font-size: 16px; font-weight: 700; }
+  #partyList .pm { font-size: 12px; opacity: .7; }
   .row { display: flex; gap: 10px; }
   .stats { display: flex; gap: 26px; flex-wrap: wrap; justify-content: center; opacity: .85; }
   .stats b { color: #9f8; font-size: 22px; display: block; }
@@ -87,10 +98,29 @@
   </div>
 </div>
 
-<div id="startScreen" class="overlay">
+<!-- ÉCRAN 1 : accueil — créer ou rejoindre -->
+<div id="menuScreen" class="overlay">
   <div class="tag">Prototype 3D · low-poly</div>
   <h1>HORDE SURVIVOR</h1>
   <div class="sub">Survis dans l'arène. Tir automatique. Ramasse les objets qui apparaissent : armes, buffs, et objets spéciaux (bombe, laser, ricochet) à lancer à la souris. À la mort, ton score part au classement.</div>
+  <div class="setting">
+    <label>🙂 Ton pseudo</label>
+    <input id="pseudoInput" maxlength="12" placeholder="Joueur" />
+  </div>
+  <div class="row">
+    <button class="btn" id="toCreateBtn">➕ Créer une partie</button>
+    <button class="btn ghost" id="toJoinBtn">🔍 Rejoindre</button>
+  </div>
+  <div class="keys">Déplacement : WASD / flèches (ZQSD sur AZERTY)<br>Objets : 1 2 3 ou clic sur le slot, puis clic au sol pour viser<br>M : son · P : pause · B : boss immédiat</div>
+</div>
+
+<!-- ÉCRAN 2 : création — l'hôte fixe les paramètres de SA partie -->
+<div id="createScreen" class="overlay hidden">
+  <h1>Nouvelle partie</h1>
+  <div class="setting">
+    <label>🏷️ Nom de la partie</label>
+    <input id="partyNameInput" maxlength="24" placeholder="Ma partie" />
+  </div>
   <div class="setting">
     <label>⏱️ Boss après <b id="bossVal">5:00</b></label>
     <input id="bossSlider" type="range" min="0" max="300" step="30" value="300" />
@@ -99,8 +129,21 @@
     <label>🧟 Densité d'ennemis <b id="densVal">✕1.0</b></label>
     <input id="densSlider" type="range" min="0" max="2" step="0.1" value="1" />
   </div>
-  <button class="btn" id="startBtn">▶ Jouer</button>
-  <div class="keys">Déplacement : WASD / flèches (ZQSD sur AZERTY)<br>Objets : 1 2 3 ou clic sur le slot, puis clic au sol pour viser<br>M : son · P : pause · B : boss immédiat</div>
+  <div class="row">
+    <button class="btn" id="createBtn">▶ Lancer la partie</button>
+    <button class="btn ghost" id="createBackBtn">← Retour</button>
+  </div>
+</div>
+
+<!-- ÉCRAN 3 : rejoindre — liste des parties en cours -->
+<div id="joinScreen" class="overlay hidden">
+  <h1>Parties en cours</h1>
+  <ol class="board" id="partyList"></ol>
+  <div id="joinEmpty" class="sub hidden">Aucune partie en cours. Crée la tienne !</div>
+  <div class="row">
+    <button class="btn" id="refreshBtn">↻ Rafraîchir</button>
+    <button class="btn ghost" id="joinBackBtn">← Retour</button>
+  </div>
 </div>
 
 <div id="deathScreen" class="overlay hidden">
@@ -109,8 +152,8 @@
   <div class="row" id="nameRow"><input id="nameInput" maxlength="12" placeholder="Ton pseudo" /><button class="btn" id="saveBtn">Envoyer</button></div>
   <div class="lbstatus" id="lbStatus"></div>
   <ol class="board" id="board"></ol>
-  <button class="btn" id="againBtn">↻ Rejouer</button>
-  <div class="keys">Entrée pour envoyer · R pour rejouer</div>
+  <button class="btn" id="againBtn">↻ Menu des parties</button>
+  <div class="keys">Entrée pour envoyer · R pour revenir au menu</div>
 </div>
 <script type="module" src="/src/game.js"></script>
 </body>

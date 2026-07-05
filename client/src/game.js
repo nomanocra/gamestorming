@@ -4,7 +4,7 @@ import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
-import { connectArena, sendPos, sendHit, sendDensity, sendShot, onShot, getRoom, getSessionId } from "./net/room";
+import { createArena, joinArenaById, leaveArena, listArenas, sendPos, sendHit, sendDensity, sendShot, onShot, getRoom, getSessionId } from "./net/room";
 
 // ============================================================
 //  CONFIG CLASSEMENT MONDIAL (Supabase). Vide = high-score LOCAL.
@@ -354,7 +354,24 @@ function newPlayer() {
 }
 function clearGroup(list) { for (const e of list) { if (e.mesh) scene.remove(e.mesh); if (e.bar) scene.remove(e.bar); } }
 
-function startGame() {
+// Pseudo courant (menu ou stocké). Persisté pour les prochaines sessions.
+function getPseudo() {
+  const el = document.getElementById("pseudoInput");
+  const n = (((el && el.value) || localStorage.getItem("hs_name") || "Joueur").trim() || "Joueur").slice(0, 12);
+  localStorage.setItem("hs_name", n);
+  return n;
+}
+
+// Bascule entre les écrans d'overlay (menu / créer / rejoindre / mort). null = tout cacher (en jeu).
+function showScreen(id) {
+  for (const s of ["menuScreen", "createScreen", "joinScreen", "deathScreen"]) {
+    const el = document.getElementById(s);
+    if (el) el.classList.toggle("hidden", s !== id);
+  }
+}
+
+// Réinitialise la partie locale et bascule en mode jeu. Appelé après create/join.
+function enterPlay() {
   if (enemies) { clearGroup(enemies); clearGroup(bullets); clearGroup(pickups); clearGroup(effects); clearGroup(particles); clearGroup(enemyBullets); }
   for (const s of remoteShots) scene.remove(s.mesh); remoteShots.length = 0;
   player = newPlayer();
@@ -364,20 +381,42 @@ function startGame() {
   petMesh.visible = true;
   enemies = []; bullets = []; pickups = []; effects = []; particles = []; enemyBullets = [];
   gameTime = 0; spawnTimer = 0; kills = 0; score = 0; armed = -1; shake = 0; scoreSaved = false;
-  const sl = document.getElementById("bossSlider");
-  bossDelay = (IS_LOCAL && sl) ? +sl.value : BOSS_TIME;
   boss = null; nextBossTime = bossDelay;
-  document.getElementById("startScreen").classList.add("hidden");
-  document.getElementById("deathScreen").classList.add("hidden");
+  sentDensity = -1; // force le renvoi de la densité au serveur (utile si on est l'hôte)
+  showScreen(null);
   document.getElementById("hud").classList.remove("hidden");
   state = "play"; lastT = performance.now();
-  // densité de horde voulue (curseur de test, local uniquement)
+}
+
+// CRÉER une partie : ce joueur devient l'hôte et fixe les paramètres.
+function createGame() {
+  if (!AC) try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  const bs = document.getElementById("bossSlider");
   const ds = document.getElementById("densSlider");
-  wantDensity = (IS_LOCAL && ds) ? +ds.value : 1;
-  sentDensity = -1; // force le renvoi au serveur (utile si on est l'hôte)
-  // --- multijoueur : rejoindre l'arène partagée. Idempotent. ---
-  // density/bossDelay ne s'appliquent que si on est le 1er joueur (hôte) qui crée la room.
-  connectArena((localStorage.getItem("hs_name") || "Joueur").slice(0, 12), { density: wantDensity, bossDelay });
+  bossDelay = bs ? +bs.value : BOSS_TIME;
+  wantDensity = ds ? +ds.value : 1;
+  const partyName = (document.getElementById("partyNameInput")?.value || "").trim();
+  createArena(getPseudo(), partyName, { density: wantDensity, bossDelay });
+  enterPlay();
+}
+
+// REJOINDRE une partie : les paramètres appartiennent à l'hôte (serveur autoritaire).
+function joinGame(roomId) {
+  if (!AC) try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  stopPartyPoll();
+  bossDelay = BOSS_TIME; wantDensity = 1; // valeurs locales sans effet en co-op (horde serveur)
+  joinArenaById(roomId, getPseudo());
+  enterPlay();
+}
+
+// Retour à l'écran d'accueil (après la mort ou depuis un sous-écran). Quitte la partie.
+function backToMenu() {
+  leaveArena();
+  state = "menu";
+  if (playerMesh) playerMesh.visible = false;
+  if (petMesh) petMesh.visible = false;
+  document.getElementById("hud").classList.add("hidden");
+  showScreen("menuScreen");
 }
 
 // ============================================================
@@ -389,7 +428,7 @@ window.addEventListener("keydown", e => {
   keys[e.code] = true;
   if (e.code === "KeyM") soundOn = !soundOn;
   if (e.code === "KeyP" && (state === "play" || state === "pause")) togglePause();
-  if (e.code === "KeyR" && state === "dead") startGame();
+  if (e.code === "KeyR" && state === "dead") backToMenu();
   if (e.code === "KeyB" && IS_LOCAL && state === "play" && !boss) {   // debug local : boss tout de suite
     nextBossTime = gameTime;
     for (const en of enemies) { scene.remove(en.mesh); scene.remove(en.bar); }
@@ -1169,24 +1208,58 @@ bossSlider.addEventListener("input", () => {
   const v = +bossSlider.value;
   $("bossVal").textContent = v === 0 ? "Direct" : `${Math.floor(v/60)}:${String(v%60).padStart(2,"0")}`;
 });
-// curseur de densité d'ennemis (outil de test) : multiplicateur envoyé au serveur
+// curseur de densité d'ennemis (écran de création) : multiplicateur de la horde
 const densSlider = $("densSlider");
 densSlider.addEventListener("input", () => {
   const v = +densSlider.value;
   $("densVal").textContent = v === 0 ? "Aucun" : "✕" + v.toFixed(1);
-  wantDensity = v;   // appliqué en direct : netSync le pousse au serveur au prochain frame
 });
-if (!IS_LOCAL) {   // en prod : on cache les curseurs de test et l'indice de la touche B
-  document.querySelectorAll("#startScreen .setting").forEach(el => el.style.display = "none");
-  const keysEl = document.querySelector("#startScreen .keys"); if (keysEl) keysEl.innerHTML = keysEl.innerHTML.replace(" · B : boss immédiat", "");
+if (!IS_LOCAL) {   // en prod : on retire juste l'indice de la touche B (debug local)
+  const keysEl = document.querySelector("#menuScreen .keys");
+  if (keysEl) keysEl.innerHTML = keysEl.innerHTML.replace(" · B : boss immédiat", "");
 }
 // détection tactile -> instructions adaptées au mobile
 const IS_TOUCH = ("ontouchstart" in window) || navigator.maxTouchPoints > 0;
 if (IS_TOUCH) {
-  const k = document.querySelector("#startScreen .keys");
+  const k = document.querySelector("#menuScreen .keys");
   if (k) k.innerHTML = "👆 Tape sur le sol pour te déplacer<br>Objets : tape un slot, puis tape où viser<br>Le tir est automatique";
 }
-$("startBtn").onclick = () => { if (!AC) try { AC = new (window.AudioContext||window.webkitAudioContext)(); } catch(e){} startGame(); };
-$("againBtn").onclick = startGame;
+// pré-remplit le pseudo depuis la dernière session
+$("pseudoInput").value = localStorage.getItem("hs_name") || "";
+
+// ---- Liste des parties en cours (écran Rejoindre) ----
+let partyPoll = null;
+function stopPartyPoll() { if (partyPoll) { clearInterval(partyPoll); partyPoll = null; } }
+async function refreshParties() {
+  const list = $("partyList");
+  const parties = await listArenas();
+  list.innerHTML = "";
+  $("joinEmpty").classList.toggle("hidden", parties.length > 0);
+  for (const p of parties) {
+    const full = p.clients >= p.maxClients;
+    const bossTxt = p.bossDelay === 0 ? "Direct" : `${Math.floor(p.bossDelay/60)}:${String(p.bossDelay%60).padStart(2,"0")}`;
+    const li = document.createElement("li");
+    if (full) li.className = "full";
+    li.innerHTML = `<span class="pn">${esc(p.partyName)}</span>` +
+      `<span class="pm">👤 ${esc(p.host)} · ${p.clients}/${p.maxClients} joueurs · 🧟 ✕${(+p.density).toFixed(1)} · ⏱ ${bossTxt}</span>`;
+    if (!full) li.onclick = () => joinGame(p.roomId);
+    list.appendChild(li);
+  }
+}
+function openJoinScreen() {
+  showScreen("joinScreen");
+  refreshParties();
+  stopPartyPoll();
+  partyPoll = setInterval(refreshParties, 3000); // rafraîchit tant que l'écran est ouvert
+}
+
+// ---- Navigation des écrans d'accueil ----
+$("toCreateBtn").onclick = () => showScreen("createScreen");
+$("toJoinBtn").onclick = openJoinScreen;
+$("createBackBtn").onclick = () => showScreen("menuScreen");
+$("joinBackBtn").onclick = () => { stopPartyPoll(); showScreen("menuScreen"); };
+$("refreshBtn").onclick = refreshParties;
+$("createBtn").onclick = createGame;
+$("againBtn").onclick = backToMenu;
 $("saveBtn").onclick = saveAndShow;
 $("nameInput").addEventListener("keydown", e => { if (e.key === "Enter") saveAndShow(); });

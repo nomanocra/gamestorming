@@ -33,12 +33,18 @@ export class ArenaRoom extends Room<ArenaState> {
   private nextBoss = 300;
   private bossId: string | null = null;
 
-  onCreate(options?: { density?: number; bossDelay?: number }) {
+  onCreate(options?: { density?: number; bossDelay?: number; partyName?: string; name?: string }) {
     this.setState(new ArenaState());
-    // paramètres définis par le joueur qui instancie la room
+    // paramètres définis par le joueur qui instancie la room (l'hôte)
     this.density = clampNum(options?.density, 0, 2, 1);
     this.bossDelay = clampNum(options?.bossDelay, 0, 300, 300);
     this.nextBoss = this.bossDelay;
+
+    // metadata : ce que la liste des parties (lobby) affiche AVANT de rejoindre.
+    // clients / maxClients sont remontés nativement par getAvailableRooms().
+    const host = (options?.name ?? "Joueur").slice(0, 12);
+    const partyName = (options?.partyName?.trim() || `Partie de ${host}`).slice(0, 24);
+    this.setMetadata({ partyName, host, density: this.density, bossDelay: this.bossDelay });
 
     this.onMessage("pos", (client, d: { x: number; z: number; aim: number; face?: number }) => {
       const p = this.state.players.get(client.sessionId);
@@ -67,11 +73,13 @@ export class ArenaRoom extends Room<ArenaState> {
     this.onMessage("density", (client, d: { d: number }) => {
       if (client.sessionId !== this.hostId) return;
       this.density = clampNum(d?.d, 0, 2, 1);
+      this.setMetadata({ density: this.density }); // garde la liste des parties à jour
     });
     this.onMessage("bossDelay", (client, d: { d: number }) => {
       if (client.sessionId !== this.hostId) return;
       this.bossDelay = clampNum(d?.d, 0, 300, 300);
       if (!this.bossId) this.nextBoss = this.bossDelay;
+      this.setMetadata({ bossDelay: this.bossDelay });
     });
 
     this.setSimulationInterval((dtMs) => this.tick(dtMs / 1000), TICK_MS);
