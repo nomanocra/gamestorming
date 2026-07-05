@@ -4,7 +4,8 @@ import { Schema, MapSchema, type } from "@colyseus/schema";
 export class Player extends Schema {
   @type("number") x = 0;
   @type("number") z = 0;
-  @type("number") aim = 0; // orientation (radians)
+  @type("number") aim = 0; // orientation de TIR (radians) — vers la cible
+  @type("number") face = 0; // orientation du CORPS / déplacement (radians)
   @type("string") name = "";
 }
 

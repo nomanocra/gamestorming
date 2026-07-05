@@ -3,7 +3,8 @@ import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import { connectArena, sendPos, sendHit, sendDensity, getRoom, getSessionId } from "./net/room";
+import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
+import { connectArena, sendPos, sendHit, sendDensity, sendShot, onShot, getRoom, getSessionId } from "./net/room";
 
 // ============================================================
 //  CONFIG CLASSEMENT MONDIAL (Supabase). Vide = high-score LOCAL.
@@ -214,6 +215,8 @@ function updateAimPreview() {
 const FACE_OFFSET = 0;  // ajuste si le perso regarde à l'envers (0, PI, ±PI/2)
 const TARGET_H = 2.0;     // hauteur cible du personnage (auto-scale, peu importe le modèle)
 let mixer = null, actIdle = null, actRun = null, charReady = false;
+// prototype scalé + clips : sert à CLONER un avatar par joueur distant (co-op)
+let charProto = null, charClips = null;
 function findClip(clips, ...keys) {   // trouve un clip par mot-clé (insensible à la casse)
   for (const k of keys) { const c = clips.find(cl => cl.name.toLowerCase().includes(k)); if (c) return c; }
   return null;
@@ -231,6 +234,7 @@ new GLTFLoader().load("assets/Barbarian.glb", g => {
   char.visible = (state === "play");
   mixer = new THREE.AnimationMixer(char);
   const clips = g.animations;
+  charProto = char; charClips = clips;   // dispo pour cloner les avatars distants
   const idleClip = findClip(clips, "idle") || clips[0];
   actIdle = mixer.clipAction(idleClip);
   actRun  = mixer.clipAction(findClip(clips, "running", "run", "walk", "sprint", "jog") || idleClip);
@@ -352,6 +356,7 @@ function clearGroup(list) { for (const e of list) { if (e.mesh) scene.remove(e.m
 
 function startGame() {
   if (enemies) { clearGroup(enemies); clearGroup(bullets); clearGroup(pickups); clearGroup(effects); clearGroup(particles); clearGroup(enemyBullets); }
+  for (const s of remoteShots) scene.remove(s.mesh); remoteShots.length = 0;
   player = newPlayer();
   if (!playerMesh) { playerMesh = buildPlayerMesh(); scene.add(playerMesh); }
   playerMesh.visible = true;
@@ -443,10 +448,14 @@ function armSlot(i) { if (!player.inv[i]) { armed = -1; return; } armed = (armed
 function addItem(key) { const f = player.inv.indexOf(null); if (f === -1) return false; player.inv[f] = key; return true; }
 function useItem(slot, wx, wz) {
   const key = player.inv[slot]; if (!key) return;
-  if (key === "bombe") { explode(wx, wz, 11, 130); shake = 0.5; }
-  else if (key === "laser") {
+  const coop = inCoop();
+  if (key === "bombe") {
+    explode(wx, wz, 11, 130); shake = 0.5;
+    if (coop) sendShot({ k:"bombe", x:wx, z:wz });
+  } else if (key === "laser") {
     const a = Math.atan2(wz - player.z, wx - player.x);
     effects.push(mkLaser(a));
+    if (coop) sendShot({ k:"laser", x:player.x, z:player.z, a });
     beep(300, 0.5, "sawtooth", 0.05);
   } else if (key === "grenade") {
     const a = Math.atan2(wz - player.z, wx - player.x);
@@ -454,6 +463,7 @@ function useItem(slot, wx, wz) {
       new THREE.MeshStandardMaterial({ color: 0xb98cff, emissive: 0xb98cff, emissiveIntensity: 1.7, flatShading: true }));
     m.position.set(player.x, BULLET_Y, player.z); scene.add(m);
     effects.push({ type:"boomerang", x:player.x, z:player.z, vx:Math.cos(a)*42, vz:Math.sin(a)*42, speed:42, life:5, r:1.1, dmg:32, bounces:6, hit:new Set(), mesh:m });
+    if (coop) sendShot({ k:"boomerang", x:player.x, z:player.z, a });
     beep(520, 0.1, "square", 0.04);
   }
   player.inv[slot] = null; armed = -1;
@@ -566,6 +576,8 @@ function loop(now) {
   if (state === "play") update(dt);
   if (mixer) mixer.update(dt);
   if (charReady) { const t = (player && player.moving && state === "play") ? 1 : 0; actRun.weight += (t - actRun.weight) * Math.min(1, dt * 10); actIdle.weight = 1 - actRun.weight; }
+  for (const av of remoteAvatars.values()) if (av.mixer) av.mixer.update(dt);   // anim des joueurs distants
+  updateRemoteShots(dt);   // projectiles cosmétiques des autres joueurs
   syncMeshes();
   netSync(now);
   // caméra suit le joueur (+ petit shake)
@@ -591,7 +603,8 @@ let netSendT = 0;
 const NET_HZ = 15;                  // fréquence d'envoi de la position
 let wantDensity = 1, sentDensity = -1;   // densité de horde voulue (outil de test)
 
-function makeRemoteAvatar(px, pz) {
+// fallback low-poly : le temps que Barbarian.glb charge (ou s'il échoue)
+function makeRemotePrimitive() {
   const g = new THREE.Group();
   const body = new THREE.Mesh(
     new THREE.CapsuleGeometry(0.55, 1.1, 4, 8),
@@ -604,10 +617,81 @@ function makeRemoteAvatar(px, pz) {
   );
   head.position.y = 2.05;
   g.add(body, head);
-  g.position.set(px, 0, pz);
-  scene.add(g);
   return g;
 }
+
+// avatar d'un joueur distant : clone du VRAI personnage (animé) si le modèle est
+// chargé, sinon primitive. Renvoie un objet { group, mixer, actIdle, actRun, isModel }.
+function makeRemoteAvatar(px, pz) {
+  let group, mixer = null, actIdle = null, actRun = null, isModel = false;
+  if (charProto) {
+    group = SkeletonUtils.clone(charProto);   // clone correct des skinned meshes (skeleton propre)
+    group.traverse(o => { if (o.isMesh) o.castShadow = true; });
+    mixer = new THREE.AnimationMixer(group);
+    const idleClip = findClip(charClips, "idle") || charClips[0];
+    if (idleClip) { actIdle = mixer.clipAction(idleClip); actIdle.play(); actIdle.weight = 1; }
+    const runClip = findClip(charClips, "running", "run", "walk", "sprint", "jog") || idleClip;
+    if (runClip) { actRun = mixer.clipAction(runClip); actRun.play(); actRun.weight = 0; }
+    isModel = true;
+  } else {
+    group = makeRemotePrimitive();
+  }
+  group.position.set(px, 0, pz);
+  scene.add(group);
+  return { group, mixer, actIdle, actRun, isModel };
+}
+
+// ---------- projectiles COSMÉTIQUES des autres joueurs ----------
+// Reçus via le relais serveur "shot". Ils ne font AUCUN dégât ici : le tireur
+// gère ses propres impacts (et signale au serveur), donc pas de double dégât.
+const remoteShots = [];
+function spawnRemoteShot(d) {
+  if (!d || state !== "play") return;
+  if (d.k === "bullet") {
+    const col = d.col ?? 0xffe98a, sp = d.sp ?? 42, life = d.life ?? 1.1;
+    for (const a of (d.angs || [])) {
+      const m = new THREE.Mesh(GEO.bullet, bulletMat(col));
+      m.position.set(d.x, BULLET_Y, d.z); scene.add(m);
+      remoteShots.push({ type:"bullet", x:d.x, z:d.z, vx:Math.cos(a)*sp, vz:Math.sin(a)*sp, life, mesh:m });
+    }
+  } else if (d.k === "bombe") {
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(1, 0.4, 6, 24), new THREE.MeshBasicMaterial({ color: 0xff9a4a }));
+    ring.rotation.x = -Math.PI / 2; ring.position.set(d.x, 0.5, d.z); scene.add(ring);
+    remoteShots.push({ type:"boom", x:d.x, z:d.z, life:0.4, max:0.4, radius:11, mesh:ring });
+    spawnParticles(d.x, d.z, 0xff9a4a, 22);
+  } else if (d.k === "laser") {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(100, 0.7, 0.7), new THREE.MeshBasicMaterial({ color: 0xff4ad0 }));
+    scene.add(m);
+    remoteShots.push({ type:"laser", x:d.x, z:d.z, ang:d.a || 0, len:100, life:0.9, max:0.9, mesh:m });
+  } else if (d.k === "boomerang") {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.25, 0.5),
+      new THREE.MeshStandardMaterial({ color: 0xb98cff, emissive: 0xb98cff, emissiveIntensity: 1.7, flatShading: true }));
+    m.position.set(d.x, BULLET_Y, d.z); scene.add(m);
+    const a = d.a || 0;
+    remoteShots.push({ type:"boomerang", x:d.x, z:d.z, vx:Math.cos(a)*42, vz:Math.sin(a)*42, life:1.4, mesh:m });
+  }
+}
+function updateRemoteShots(dt) {
+  for (let i = remoteShots.length - 1; i >= 0; i--) {
+    const s = remoteShots[i];
+    s.life -= dt;
+    if (s.type === "bullet" || s.type === "boomerang") {
+      s.x += s.vx * dt; s.z += s.vz * dt;
+      s.mesh.position.set(s.x, BULLET_Y, s.z);
+      if (s.type === "boomerang") s.mesh.rotation.y += 0.7;
+    } else if (s.type === "boom") {
+      const k = 1 - s.life / s.max;
+      s.mesh.scale.setScalar(0.5 + s.radius * k);
+      s.mesh.material.transparent = true; s.mesh.material.opacity = Math.max(0, s.life / s.max);
+    } else if (s.type === "laser") {
+      s.mesh.position.set(s.x + Math.cos(s.ang) * s.len / 2, 1.1, s.z + Math.sin(s.ang) * s.len / 2);
+      s.mesh.rotation.y = -s.ang;
+      const t = s.life / s.max; s.mesh.scale.set(1, 0.4 + t, 0.4 + t);
+    }
+    if (s.life <= 0) { scene.remove(s.mesh); remoteShots.splice(i, 1); }
+  }
+}
+onShot(spawnRemoteShot);   // enregistre le rendu des tirs distants
 
 // --- co-op : horde autoritaire serveur reflétée dans le tableau `enemies` ---
 const inCoop = () => !!getRoom();
@@ -677,7 +761,7 @@ function updateTeammateArrows(room, me) {
     seen.add(id);
     // on prend la position lissée de l'avatar si dispo (plus stable)
     const av = remoteAvatars.get(id);
-    _v.set(av ? av.position.x : p.x, 1.2, av ? av.position.z : p.z);
+    _v.set(av ? av.group.position.x : p.x, 1.2, av ? av.group.position.z : p.z);
     _v.project(camera);                  // -> NDC ; z>1 = derrière la caméra
     let x = _v.x, y = _v.y;
     const behind = _v.z > 1;
@@ -707,10 +791,10 @@ function netSync(now) {
   // 0) pousser la densité de test au serveur si elle a changé
   if (wantDensity !== sentDensity) { sendDensity(wantDensity); sentDensity = wantDensity; }
 
-  // 1) envoyer MA position (throttle à NET_HZ)
+  // 1) envoyer MA position (throttle à NET_HZ) — aim = tir, face = corps
   if (player && state === "play" && now - netSendT > 1000 / NET_HZ) {
     netSendT = now;
-    sendPos(player.x, player.z, (player.aim ?? player.face) || 0);
+    sendPos(player.x, player.z, (player.aim ?? player.face) || 0, player.face || 0);
   }
 
   // 2) refléter les joueurs distants (interpolation simple)
@@ -721,13 +805,28 @@ function netSync(now) {
     seen.add(id);
     let av = remoteAvatars.get(id);
     if (!av) { av = makeRemoteAvatar(p.x, p.z); remoteAvatars.set(id, av); }
-    av.position.x += (p.x - av.position.x) * 0.25;
-    av.position.z += (p.z - av.position.z) * 0.25;
-    av.rotation.y = -(p.aim || 0) + Math.PI / 2;
-    av.visible = (state === "play");
+    // upgrade primitive -> vrai modèle dès que Barbarian.glb est chargé
+    else if (!av.isModel && charProto) {
+      scene.remove(av.group);
+      av = makeRemoteAvatar(av.group.position.x, av.group.position.z);
+      remoteAvatars.set(id, av);
+    }
+    const g = av.group;
+    g.position.x += (p.x - g.position.x) * 0.25;
+    g.position.z += (p.z - g.position.z) * 0.25;
+    // orientation du CORPS via `face` (identique au joueur local)
+    g.rotation.y = (p.face || 0) + FACE_OFFSET;
+    g.visible = (state === "play");
+    // blend course/idle : distant = tant que l'avatar rattrape sa position serveur
+    if (av.actRun) {
+      const gap = Math.hypot(p.x - g.position.x, p.z - g.position.z);
+      const t = gap > 0.15 ? 1 : 0;
+      av.actRun.weight += (t - av.actRun.weight) * 0.2;
+      if (av.actIdle) av.actIdle.weight = 1 - av.actRun.weight;
+    }
   });
   for (const [id, av] of remoteAvatars) {
-    if (!seen.has(id)) { scene.remove(av); remoteAvatars.delete(id); }
+    if (!seen.has(id)) { scene.remove(av.group); remoteAvatars.delete(id); }
   }
 
   // 3) refléter la horde autoritaire (positions serveur + interpolation légère)
@@ -799,13 +898,17 @@ function update(dt) {
   const interval = w.fireInt * (player.frenzy > 0 ? 0.5 : 1);
   if (player.fireT <= 0 && player.hasAim) {
     const px = petMesh ? petMesh.position.x : player.x, pz = petMesh ? petMesh.position.z : player.z;
+    const angs = [];
     for (let i = 0; i < w.count; i++) {
       const off = (i - (w.count - 1) / 2) * w.spread;
       const a = player.aim + off + rand(-w.spread * 0.15, w.spread * 0.15);
+      angs.push(a);
       const m = new THREE.Mesh(GEO.bullet, bulletMat(w.col));
       m.position.set(px, BULLET_Y, pz); scene.add(m);
       bullets.push({ x:px, z:pz, vx:Math.cos(a)*w.projSpeed, vz:Math.sin(a)*w.projSpeed, life:w.life || 1.1, dmg:w.dmg, pierce:w.pierce, mesh:m });
     }
+    // co-op : les autres joueurs voient mes tirs (cosmétique)
+    if (inCoop()) sendShot({ k:"bullet", x:px, z:pz, angs, sp:w.projSpeed, col:w.col, life:w.life || 1.1 });
     player.fireT = interval; beep(660, 0.04, "square", 0.015);
   }
 

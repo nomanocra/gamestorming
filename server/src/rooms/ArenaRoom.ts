@@ -40,10 +40,20 @@ export class ArenaRoom extends Room<ArenaState> {
     this.bossDelay = clampNum(options?.bossDelay, 0, 300, 300);
     this.nextBoss = this.bossDelay;
 
-    this.onMessage("pos", (client, d: { x: number; z: number; aim: number }) => {
+    this.onMessage("pos", (client, d: { x: number; z: number; aim: number; face?: number }) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
       p.x = d.x; p.z = d.z; p.aim = d.aim;
+      if (typeof d.face === "number") p.face = d.face;
+    });
+
+    // Relais COSMÉTIQUE des projectiles d'un joueur (tir arme / objet lancé).
+    // Le serveur ne simule PAS ces projectiles : ils sont purement visuels chez
+    // les autres joueurs. Les dégâts restent gérés par le tireur via "hit"
+    // (le serveur reste autoritaire sur les hp) -> aucun risque de double dégât.
+    this.onMessage("shot", (client, d: unknown) => {
+      if (!d || typeof d !== "object") return;
+      this.broadcast("shot", { ...(d as object), from: client.sessionId }, { except: client });
     });
 
     this.onMessage("hit", (_client, d: { id: string; dmg: number }) => {

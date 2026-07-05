@@ -8,6 +8,8 @@ import { Client, Room } from "colyseus.js";
 
 let room: Room | null = null;
 let connecting = false;
+// callback rendu (game.js) appelé quand un AUTRE joueur tire / lance un objet
+let shotCb: ((d: any) => void) | null = null;
 
 function endpoint(): string {
   // Optionnel : forcer une URL via VITE_SERVER_URL.
@@ -37,6 +39,8 @@ export async function connectArena(
     const client = new Client(endpoint());
     // density/bossDelay ne comptent que pour le 1er joueur (création de la room)
     room = await client.joinOrCreate("arena", { name, ...opts });
+    // projectiles cosmétiques diffusés par les autres joueurs
+    room.onMessage("shot", (d: any) => shotCb?.(d));
     room.onError((code, message) => console.warn("[net] erreur room:", code, message));
     room.onLeave(() => {
       console.log("[net] quitté l'arène");
@@ -54,8 +58,18 @@ export async function connectArena(
   }
 }
 
-export function sendPos(x: number, z: number, aim: number): void {
-  room?.send("pos", { x, z, aim });
+export function sendPos(x: number, z: number, aim: number, face: number): void {
+  room?.send("pos", { x, z, aim, face });
+}
+
+// Diffuse un projectile (tir/objet) aux autres joueurs — purement cosmétique.
+export function sendShot(d: any): void {
+  room?.send("shot", d);
+}
+
+// Enregistre le rendu des projectiles distants (game.js possède THREE + la scène).
+export function onShot(cb: (d: any) => void): void {
+  shotCb = cb;
 }
 
 // Signale au serveur qu'une balle/objet a touché l'ennemi `id`.
