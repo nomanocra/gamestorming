@@ -2,8 +2,11 @@ import { Room, Client } from "colyseus";
 import { ArenaState, Player, Enemy } from "../schema/ArenaState";
 
 const TICK_MS = 50; // simulation à 20 Hz
-const MAX_ENEMIES = 220; // garde-fou (serveur Node mono-thread)
-const BASE_CAP = 100; // population cible à densité ✕1 (cap = BASE_CAP * densité)
+const MAX_ENEMIES = 400; // garde-fou absolu (limite de rendu client mobile, pas le serveur)
+const BASE_CAP = 100; // population cible à densité ✕1 pour 1 joueur
+// Le cap monte avec le nb de joueurs : chaque joueur en plus ajoute 1× (k=1).
+// À densité ✕1 -> 100 / 200 / 300 / 400 ennemis pour 1 / 2 / 3 / 4 joueurs.
+const PLAYER_SCALE = 1;
 
 type EnemyType = { kind: string; r: number; speed: number; hp: number; dmg: number; sc: number };
 
@@ -91,9 +94,12 @@ export class ArenaRoom extends Room<ArenaState> {
     if (players.length === 0) return;
     this.state.elapsed += dt;
 
+    // facteur d'échelle co-op : 1 joueur -> 1, +1 par joueur supplémentaire (k=1)
+    const playerScale = 1 + (players.length - 1) * PLAYER_SCALE;
+
     if (!this.bossId) {
-      // phase horde normale, pilotée par la densité (cap + taux de spawn)
-      const cap = Math.min(MAX_ENEMIES, Math.round(BASE_CAP * this.density));
+      // phase horde normale, pilotée par la densité ET le nb de joueurs (cap + taux de spawn)
+      const cap = Math.min(MAX_ENEMIES, Math.round(BASE_CAP * this.density * playerScale));
       if (this.state.enemies.size > cap) {
         const ids = [...this.state.enemies.keys()];
         for (let k = cap; k < ids.length; k++) this.killEnemy(ids[k], true); // culling silencieux
@@ -101,7 +107,8 @@ export class ArenaRoom extends Room<ArenaState> {
       if (this.state.elapsed < this.nextBoss) {
         this.spawnAcc -= dt;
         if (this.spawnAcc <= 0 && this.state.enemies.size < cap) {
-          this.spawnAcc = Math.max(0.16, 1.1 - this.state.elapsed * 0.013) / Math.max(0.25, this.density);
+          // le rythme de spawn accélère avec la densité et le nb de joueurs -> remplit le cap plus vite
+          this.spawnAcc = Math.max(0.16, 1.1 - this.state.elapsed * 0.013) / Math.max(0.25, this.density * playerScale);
           this.spawnEnemy(players);
         }
       } else if (this.state.enemies.size === 0) {
