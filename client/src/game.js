@@ -362,9 +362,9 @@ function getPseudo() {
   return n;
 }
 
-// Bascule entre les écrans d'overlay (menu / créer / rejoindre / mort). null = tout cacher (en jeu).
+// Bascule entre les écrans d'overlay (pseudo / lobby / mort). null = tout cacher (en jeu).
 function showScreen(id) {
-  for (const s of ["menuScreen", "createScreen", "joinScreen", "deathScreen"]) {
+  for (const s of ["pseudoScreen", "lobbyScreen", "deathScreen"]) {
     const el = document.getElementById(s);
     if (el) el.classList.toggle("hidden", s !== id);
   }
@@ -383,6 +383,7 @@ function enterPlay() {
   gameTime = 0; spawnTimer = 0; kills = 0; score = 0; armed = -1; shake = 0; scoreSaved = false;
   boss = null; nextBossTime = bossDelay;
   sentDensity = -1; // force le renvoi de la densité au serveur (utile si on est l'hôte)
+  stopPartyPoll(); // plus besoin de rafraîchir la liste des parties en jeu
   showScreen(null);
   document.getElementById("hud").classList.remove("hidden");
   state = "play"; lastT = performance.now();
@@ -409,14 +410,14 @@ function joinGame(roomId) {
   enterPlay();
 }
 
-// Retour à l'écran d'accueil (après la mort ou depuis un sous-écran). Quitte la partie.
+// Retour au lobby (après la mort). Quitte la partie et rouvre la liste des parties.
 function backToMenu() {
   leaveArena();
   state = "menu";
   if (playerMesh) playerMesh.visible = false;
   if (petMesh) petMesh.visible = false;
   document.getElementById("hud").classList.add("hidden");
-  showScreen("menuScreen");
+  openLobby();
 }
 
 // ============================================================
@@ -1299,18 +1300,21 @@ async function refreshParties() {
     list.appendChild(li);
   }
 }
-function openJoinScreen() {
-  showScreen("joinScreen");
+// Valide le pseudo saisi puis ouvre le lobby (créer / rejoindre) avec rafraîchissement live.
+function openLobby() {
+  const name = getPseudo(); // valide + persiste le pseudo
+  showScreen("lobbyScreen");
+  const hello = $("lobbyHello");
+  if (hello) hello.textContent = `Salut ${name} 👋`;
   refreshParties();
   stopPartyPoll();
-  partyPoll = setInterval(refreshParties, 3000); // rafraîchit tant que l'écran est ouvert
+  partyPoll = setInterval(refreshParties, 3000); // rafraîchit tant que le lobby est ouvert
 }
 
 // ---- Navigation des écrans d'accueil ----
-$("toCreateBtn").onclick = () => showScreen("createScreen");
-$("toJoinBtn").onclick = openJoinScreen;
-$("createBackBtn").onclick = () => showScreen("menuScreen");
-$("joinBackBtn").onclick = () => { stopPartyPoll(); showScreen("menuScreen"); };
+$("pseudoContinueBtn").onclick = openLobby;
+$("pseudoInput").addEventListener("keydown", e => { if (e.key === "Enter") openLobby(); });
+$("changePseudoBtn").onclick = () => { stopPartyPoll(); showScreen("pseudoScreen"); };
 $("refreshBtn").onclick = refreshParties;
 $("createBtn").onclick = createGame;
 $("againBtn").onclick = backToMenu;
