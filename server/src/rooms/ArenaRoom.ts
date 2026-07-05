@@ -1,5 +1,14 @@
 import { Room, Client } from "colyseus";
-import { ArenaState, Player, Enemy } from "../schema/ArenaState";
+import { ArenaState, Player, Enemy, Pickup } from "../schema/ArenaState";
+
+// Pools de butin — DOIVENT rester alignés avec les définitions client (game.js).
+const WEAPON_KEYS = ["pistolet", "mitraillette", "pompe", "canon", "triple", "flamme"];
+const ITEM_KEYS = ["bombe", "laser", "grenade"];
+// pioche pondérée : le soin (vie) est ~2x plus rare que les autres buffs
+const BUFF_POOL = ["bouclier", "bouclier", "vitesse", "vitesse", "frenesie", "frenesie", "soin"];
+const GRAB_RANGE2 = 25; // distance² max autorisée pour ramasser (garde-fou anti-triche)
+
+const pickOne = <T>(arr: T[]): T => arr[(Math.random() * arr.length) | 0];
 
 const TICK_MS = 50; // simulation à 20 Hz
 const MAX_ENEMIES = 400; // garde-fou absolu (limite de rendu client mobile, pas le serveur)
@@ -70,6 +79,20 @@ export class ArenaRoom extends Room<ArenaState> {
       if (!e) return;
       e.hp -= d.dmg;
       if (e.hp <= 0) this.killEnemy(d.id);
+    });
+
+    // Ramassage d'un butin : le serveur valide la proximité, retire le pickup pour
+    // TOUS (via l'état répliqué) et renvoie l'effet au SEUL ramasseur (l'arme/buff
+    // ne concerne que son perso). Le premier à réclamer un pickup l'emporte.
+    this.onMessage("grab", (client, d: { id: string }) => {
+      const p = this.state.pickups.get(d?.id);
+      if (!p) return; // déjà ramassé par quelqu'un d'autre
+      const pl = this.state.players.get(client.sessionId);
+      if (!pl) return;
+      const dx = pl.x - p.x, dz = pl.z - p.z;
+      if (dx * dx + dz * dz > GRAB_RANGE2) return; // trop loin -> ignoré
+      client.send("grabbed", { kind: p.kind, key: p.key });
+      this.state.pickups.delete(d.id);
     });
 
     // seul l'hôte peut modifier les params en cours de partie (outil de test)
@@ -160,10 +183,20 @@ export class ArenaRoom extends Room<ArenaState> {
   }
 
   private killEnemy(id: string, culled = false) {
-    if (!this.state.enemies.has(id)) return;
+    const e = this.state.enemies.get(id);
+    if (!e) return;
     if (!culled) {
       this.state.kills++;
       this.state.score += this.meta.get(id)?.sc ?? 10;
+      // butin (autoritaire) : mêmes taux que le solo. Boss -> 6 drops garantis.
+      if (id === this.bossId) {
+        for (let k = 0; k < 6; k++) {
+          const aa = Math.random() * Math.PI * 2;
+          this.dropRandom(e.x + Math.cos(aa) * 4, e.z + Math.sin(aa) * 4);
+        }
+      } else {
+        this.rollDrop(e.x, e.z);
+      }
     }
     this.state.enemies.delete(id);
     this.meta.delete(id);
@@ -171,6 +204,28 @@ export class ArenaRoom extends Room<ArenaState> {
       this.bossId = null;
       this.nextBoss = this.state.elapsed + this.bossDelay; // boss récurrent, comme le solo
     }
+  }
+
+  // Fait apparaître un butin dans l'état partagé (visible par tous les joueurs).
+  private spawnPickup(x: number, z: number, kind: string, key: string) {
+    const p = new Pickup();
+    p.x = x; p.z = z; p.kind = kind; p.key = key;
+    this.state.pickups.set("p" + this.seq++, p);
+  }
+
+  // Drop pondéré d'un ennemi normal : 5% arme, 8% objet, 17% buff, 70% rien.
+  private rollDrop(x: number, z: number) {
+    const r = Math.random();
+    if (r < 0.05) this.spawnPickup(x, z, "weapon", pickOne(WEAPON_KEYS));
+    else if (r < 0.13) this.spawnPickup(x, z, "item", pickOne(ITEM_KEYS));
+    else if (r < 0.30) this.spawnPickup(x, z, "buff", pickOne(BUFF_POOL));
+  }
+
+  // Drop garanti (boss) : une catégorie au hasard, puis une clé dans cette catégorie.
+  private dropRandom(x: number, z: number) {
+    const tables: [string, string[]][] = [["weapon", WEAPON_KEYS], ["item", ITEM_KEYS], ["buff", BUFF_POOL]];
+    const [kind, keys] = pickOne(tables);
+    this.spawnPickup(x, z, kind, pickOne(keys));
   }
 
   onJoin(client: Client, options?: { name?: string }) {

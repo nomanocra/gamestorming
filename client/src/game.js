@@ -4,7 +4,7 @@ import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
-import { createArena, joinArenaById, leaveArena, listArenas, sendPos, sendHit, sendDensity, sendShot, onShot, getRoom, getSessionId } from "./net/room";
+import { createArena, joinArenaById, leaveArena, listArenas, sendPos, sendHit, sendDensity, sendShot, onShot, sendGrab, onGrabbed, getRoom, getSessionId } from "./net/room";
 
 // ============================================================
 //  CONFIG CLASSEMENT MONDIAL (Supabase). Vide = high-score LOCAL.
@@ -373,6 +373,8 @@ function showScreen(id) {
 // Réinitialise la partie locale et bascule en mode jeu. Appelé après create/join.
 function enterPlay() {
   if (enemies) { clearGroup(enemies); clearGroup(bullets); clearGroup(pickups); clearGroup(effects); clearGroup(particles); clearGroup(enemyBullets); }
+  // les miroirs du serveur pointent vers des meshes qu'on vient de retirer -> on repart propre
+  netEnemies.clear(); netPickups.clear();
   for (const s of remoteShots) scene.remove(s.mesh); remoteShots.length = 0;
   player = newPlayer();
   if (!playerMesh) { playerMesh = buildPlayerMesh(); scene.add(playerMesh); }
@@ -578,7 +580,8 @@ function rollDrop(x, z) {
   else if (r < 0.13) dropPickup(x, z, "item", pick(ITEM_KEYS));
   else if (r < 0.30) dropPickup(x, z, "buff", pick(BUFF_POOL));
 }
-function dropPickup(x, z, kind, key) {
+// Construit la boule de butin (globe + halo + icône) à (x,z). Renvoie { g, ico }.
+function makePickupMesh(x, z, kind, key) {
   let col, ico;
   if (kind === "weapon") { col = BASE_WEAPONS[key].col; ico = BASE_WEAPONS[key].ico; }
   else if (kind === "item") { col = ITEMS[key].col; ico = ITEMS[key].ico; }
@@ -591,8 +594,27 @@ function dropPickup(x, z, kind, key) {
   g.add(globe); g.add(halo);
   g.add(makeIconSprite(ico)); // l'icône flotte au centre de la boule
   g.position.set(x, 1.4, z); scene.add(g);
+  return { g, ico };
+}
+// SOLO : crée un butin local (le serveur s'en charge en co-op, voir netSync).
+function dropPickup(x, z, kind, key) {
+  const { g, ico } = makePickupMesh(x, z, kind, key);
   pickups.push({ x, z, kind, key, ico, r: 1.4, bob: rand(0, 6.28), mesh: g });
 }
+// Applique l'effet d'un butin au joueur local. Renvoie false si un OBJET n'a pas
+// pu être pris (inventaire plein) -> le pickup doit rester au sol.
+function applyPickupEffect(kind, key) {
+  if (kind === "weapon") {
+    const lv = (player.weaponLvl[key] || 0) + 1; player.weaponLvl[key] = lv;
+    player.weapon = computeWeapon(key, lv);
+    toast(`${player.weapon.ico} ${player.weapon.name} Nv.${lv}`); beep(900, 0.1, "square", 0.04);
+    return true;
+  }
+  if (kind === "buff") { BUFFS[key].apply(player); beep(1000, 0.08, "sine", 0.03); return true; }
+  if (!addItem(key)) return false;
+  beep(760, 0.08, "square", 0.03); return true;
+}
+const invFull = () => player.inv.indexOf(null) === -1;
 
 // ============================================================
 //  PARTICULES
@@ -803,6 +825,24 @@ function removeNetEnemy(id) {
   const i = enemies.indexOf(e); if (i >= 0) enemies.splice(i, 1);
   netEnemies.delete(id);
 }
+
+// --- co-op : butin autoritaire serveur reflété dans le tableau `pickups` ---
+const netPickups = new Map();               // serverId -> pickup miroir (aussi dans `pickups`)
+function buildNetPickup(id, sp) {
+  const { g, ico } = makePickupMesh(sp.x, sp.z, sp.kind, sp.key);
+  const p = { id, net: true, x: sp.x, z: sp.z, kind: sp.kind, key: sp.key, ico, r: 1.4, bob: rand(0, 6.28), mesh: g, claimed: false };
+  pickups.push(p); netPickups.set(id, p);
+  return p;
+}
+function removeNetPickup(id) {
+  const p = netPickups.get(id); if (!p) return;
+  scene.remove(p.mesh);
+  const i = pickups.indexOf(p); if (i >= 0) pickups.splice(i, 1);
+  netPickups.delete(id);
+}
+// Le serveur a validé notre ramassage -> on applique l'effet (le pickup disparaît
+// pour tous via l'état répliqué, géré par removeNetPickup au prochain sync).
+onGrabbed(d => { if (player) applyPickupEffect(d.kind, d.key); });
 // point de dégât unique : en co-op on signale au serveur (autoritaire) ; sinon local.
 function damageEnemy(e, dmg) {
   e.hp -= dmg;                 // feedback instantané (barre) ; le serveur corrige au sync
@@ -932,6 +972,14 @@ function netSync(now) {
     e.hp = se.hp; e.maxHp = se.maxHp;
   });
   for (const id of netEnemies.keys()) if (!seenE.has(id)) removeNetEnemy(id);
+
+  // 3bis) refléter le butin autoritaire (spawn/retrait pilotés par le serveur)
+  const seenP = new Set();
+  room.state.pickups.forEach((sp, id) => {
+    seenP.add(id);
+    if (!netPickups.has(id)) buildNetPickup(id, sp);
+  });
+  for (const id of netPickups.keys()) if (!seenP.has(id)) removeNetPickup(id);
 
   // 4) score & kills partagés (autoritaires)
   score = room.state.score;
@@ -1076,13 +1124,15 @@ function update(dt) {
     const p = pickups[i];
     const rr = p.r + player.r + 0.6;
     if (dist2(p.x, p.z, player.x, player.z) < rr * rr) {
-      if (p.kind === "weapon") {
-        const lv = (player.weaponLvl[p.key] || 0) + 1; player.weaponLvl[p.key] = lv;
-        player.weapon = computeWeapon(p.key, lv);
-        toast(`${player.weapon.ico} ${player.weapon.name} Nv.${lv}`); beep(900,0.1,"square",0.04);
+      if (p.net) {
+        // butin autoritaire : on DEMANDE au serveur, sans appliquer localement.
+        // Le serveur tranche (1er arrivé) et retire le pickup pour tous.
+        if (p.claimed) continue;                          // déjà demandé -> pas de spam
+        if (p.kind === "item" && invFull()) continue;     // inventaire plein -> on le laisse
+        p.claimed = true; sendGrab(p.id);
+        continue;
       }
-      else if (p.kind === "buff") { BUFFS[p.key].apply(player); beep(1000,0.08,"sine",0.03); }
-      else { if (!addItem(p.key)) continue; beep(760,0.08,"square",0.03); }
+      if (!applyPickupEffect(p.kind, p.key)) continue;    // solo : objet + inventaire plein -> reste au sol
       scene.remove(p.mesh); pickups.splice(i, 1);
     }
   }
